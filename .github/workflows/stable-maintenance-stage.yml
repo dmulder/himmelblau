@@ -130,9 +130,14 @@ jobs:
           set-safe-directory: false
 
       - name: Test trusted automation before repository mutation
+        timeout-minutes: 20
         # Temporary Git fixtures own their main refs; the job's immutable
         # snapshot applies to real maintenance phases, not fixture repositories.
-        run: env -u MAINTENANCE_TOOLING_COMMIT python3 tooling/.github/scripts/test_stable_maintenance.py
+        env:
+          MAINTENANCE_PREMUTATION_QUICK: ${{ inputs.stage != 'dependencies' && '1' || '' }}
+        run: >-
+          env -u MAINTENANCE_TOOLING_COMMIT PYTHONDONTWRITEBYTECODE=1
+          python3 tooling/.github/scripts/test_stable_maintenance.py
 
       - name: Initialize hardened Git configuration and exact refs
         shell: bash

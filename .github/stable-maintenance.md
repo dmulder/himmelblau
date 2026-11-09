@@ -103,6 +103,12 @@ errors remain explicit failures: recovery never substitutes an unverified tree.
 The durable checkpoint source parent remains available for manual recovery when
 runner failure or a GitHub outage makes publication impossible.
 
+The dependencies stage runs the full tooling test module before any repository
+mutation. Later checkpointed stages run a bounded trust-boundary subset under
+`MAINTENANCE_PREMUTATION_QUICK` (the select job still executes the full module
+once per workflow run). The pre-mutation step enforces a twenty-minute ceiling so
+a hung runner cannot stall salvage for most of a job.
+
 Use Actions' **Re-run failed jobs** to resume a failed, pre-publication stage
 from its predecessor without repeating successful earlier stages. Reruns keep the original trusted
 tooling snapshot; checkpoints from earlier attempts of the same run are allowed,

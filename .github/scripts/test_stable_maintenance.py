@@ -29,6 +29,14 @@ ORPHAN_FIXTURE_FAILURE = "grandchild {orphan} survived the process-group kill"
 WORKFLOW = SCRIPT.parent.parent / "workflows" / "stable-maintenance.yml"
 STAGE_WORKFLOW = WORKFLOW.with_name("stable-maintenance-stage.yml")
 BRANCH_WORKFLOW = WORKFLOW.with_name("stable-maintenance-branch.yml")
+# Trust-boundary checks for checkpointed resume jobs; dependencies still runs the full suite.
+PREMUTATION_RESUME_TEST_CLASSES = (
+    "GuardTests",
+    "CheckpointMaintenanceTests",
+    "MutationBoundaryTests",
+    "RecoveryMaintenanceTests",
+    "VersionPolicyTests",
+)
 SPEC = importlib.util.spec_from_file_location("stable_maintenance", SCRIPT)
 assert SPEC and SPEC.loader
 sm = importlib.util.module_from_spec(SPEC)
@@ -5078,7 +5086,10 @@ class CheckpointMaintenanceTests(unittest.TestCase):
                 self.assertIn(f"needs.{previous}.outputs.{field}", block)
         self.assertEqual(branch.count("uses: ./.github/workflows/stable-maintenance-stage.yml"), 7)
         self.assertIn("MAINTENANCE_TOOLING_COMMIT: ${{ github.sha }}", stage)
-        self.assertIn("run: env -u MAINTENANCE_TOOLING_COMMIT python3 tooling/.github/scripts/test_stable_maintenance.py", stage)
+        premutation = stage.split("      - name: Test trusted automation before repository mutation", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn("timeout-minutes: 20", premutation)
+        self.assertIn("MAINTENANCE_PREMUTATION_QUICK", premutation)
+        self.assertIn("env -u MAINTENANCE_TOOLING_COMMIT", premutation)
         self.assertNotIn("workflow_run:", stage + branch + WORKFLOW.read_text())
         self.assertNotIn("continue-on-error:", stage + branch)
         for name in ("Release —", "Validate —", "Create scoped publication token", "Publish —"):
@@ -6775,6 +6786,10 @@ class RecoveryMaintenanceTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    import sys
+
+    if os.environ.get("MAINTENANCE_PREMUTATION_QUICK") == "1" and len(sys.argv) == 1:
+        sys.argv.extend(PREMUTATION_RESUME_TEST_CLASSES)
     unittest.main(verbosity=2)
 
 
