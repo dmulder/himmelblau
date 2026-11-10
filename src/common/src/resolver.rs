@@ -25,8 +25,9 @@ use lru::LruCache;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::constants::SERVER_CONFIG_PATH;
+use crate::constants::{ID_MAP_CACHE, SERVER_CONFIG_PATH};
 use crate::db::{Cache, CacheTxn, Db};
+use crate::idmap_cache::{StaticGroup, StaticIdCache, StaticUser};
 use crate::idprovider::interface::{
     AuthCacheAction,
     AuthCredHandler,
@@ -672,6 +673,47 @@ where
         }
     }
 
+    fn resolve_usertoken_lookup_id(account_id: &Id) -> Id {
+        match account_id {
+            Id::Gid(gid) => StaticIdCache::new(ID_MAP_CACHE, false)
+                .ok()
+                .and_then(|cache| cache.get_user_by_uid(*gid))
+                .map(|user| Id::Name(user.name))
+                .unwrap_or_else(|| account_id.clone()),
+            other => other.clone(),
+        }
+    }
+
+    fn resolve_grouptoken_lookup_id(grp_id: &Id) -> Id {
+        match grp_id {
+            Id::Gid(gid) => StaticIdCache::new(ID_MAP_CACHE, false)
+                .ok()
+                .and_then(|cache| cache.get_group_by_gid(*gid))
+                .map(|group| Id::Name(group.name))
+                .unwrap_or_else(|| grp_id.clone()),
+            other => other.clone(),
+        }
+    }
+
+    fn persist_idmap_for_usertoken(token: &UserToken) {
+        if let Ok(idmap) = StaticIdCache::new(ID_MAP_CACHE, true) {
+            let _ = idmap.insert_user(&StaticUser {
+                name: token.spn.clone(),
+                uid: token.gidnumber,
+                gid: token.real_gidnumber.unwrap_or(token.gidnumber),
+            });
+        }
+    }
+
+    fn persist_idmap_for_grouptoken(token: &GroupToken) {
+        if let Ok(idmap) = StaticIdCache::new(ID_MAP_CACHE, true) {
+            let _ = idmap.insert_group(&StaticGroup {
+                name: token.spn.clone(),
+                gid: token.gidnumber,
+            });
+        }
+    }
+
     async fn set_cache_usertoken(&self, token: &mut UserToken) -> Result<(), ()> {
         // Set an expiry
         let ex_time = SystemTime::now() + Duration::from_secs(self.timeout_seconds);
@@ -725,6 +767,9 @@ where
                     .update_account(token, offset.as_secs()))
             .and_then(|_| dbtxn.commit())
             .map_err(|_| ())
+            .map(|_| {
+                Self::persist_idmap_for_usertoken(token);
+            })
     }
 
     async fn set_cache_grouptoken(&self, token: &GroupToken) -> Result<(), ()> {
@@ -741,6 +786,9 @@ where
             .update_group(token, offset.as_secs())
             .and_then(|_| dbtxn.commit())
             .map_err(|_| ())
+            .map(|_| {
+                Self::persist_idmap_for_grouptoken(token);
+            })
     }
 
     async fn delete_cache_usertoken(&self, a_uuid: Uuid) -> Result<(), ()> {
@@ -782,13 +830,18 @@ where
         account_id: &Id,
         token: Option<UserToken>,
     ) -> Result<Option<UserToken>, ()> {
+        let lookup_id = match account_id {
+            Id::Gid(_) if token.is_none() => Self::resolve_usertoken_lookup_id(account_id),
+            _ => account_id.clone(),
+        };
+
         let mut hsm_lock = self.hsm.lock().await;
         let mut dbtxn = self.db.write().await;
 
         let user_get_result = self
             .client
             .unix_user_get(
-                account_id,
+                &lookup_id,
                 token.as_ref(),
                 &mut dbtxn,
                 hsm_lock.deref_mut(),
@@ -829,11 +882,16 @@ where
         grp_id: &Id,
         token: Option<GroupToken>,
     ) -> Result<Option<GroupToken>, ()> {
+        let lookup_id = match grp_id {
+            Id::Gid(_) if token.is_none() => Self::resolve_grouptoken_lookup_id(grp_id),
+            _ => grp_id.clone(),
+        };
+
         let mut hsm_lock = self.hsm.lock().await;
 
         let group_get_result = self
             .client
-            .unix_group_get(grp_id, hsm_lock.deref_mut())
+            .unix_group_get(&lookup_id, hsm_lock.deref_mut())
             .await;
 
         drop(hsm_lock);
@@ -1093,12 +1151,19 @@ where
             trace!("get_usertoken error -> {:?}", e);
         })?;
 
-        let state = match account_id {
-            Id::Name(ref name) => self.get_cachestate(Some(name)).await,
-            Id::Gid(_) => match &item {
-                Some(token) => self.get_cachestate(Some(&token.spn)).await,
-                None => self.get_cachestate(None).await,
-            },
+        let state_lookup_name = match &account_id {
+            Id::Name(name) => Some(name.clone()),
+            Id::Gid(_) => item.as_ref().map(|token| token.spn.clone()).or_else(|| {
+                match Self::resolve_usertoken_lookup_id(&account_id) {
+                    Id::Name(name) => Some(name),
+                    _ => None,
+                }
+            }),
+        };
+
+        let state = match state_lookup_name.as_deref() {
+            Some(name) => self.get_cachestate(Some(name)).await,
+            None => self.get_cachestate(None).await,
         };
 
         match (expired, state) {
