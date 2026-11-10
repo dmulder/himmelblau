@@ -1,13 +1,16 @@
-.TH HIMMELBLAU.CONF "5" "July 2026" "Himmelblau Configuration" "File Formats"
+.TH HIMMELBLAU.CONF "5" "November 2026" "Himmelblau Configuration" "File Formats"
 .SH NAME
 himmelblau.conf \- Configuration file for Himmelblau, enabling Azure Entra ID authentication on Linux.
 
 .SH SYNOPSIS
+.B /usr/lib/himmelblau/himmelblau.conf
+.br
+.B /run/himmelblau/himmelblau.conf
+.br
 .B /etc/himmelblau/himmelblau.conf
 
 .SH HOW CONFIGURATION CHANGES ARE APPLIED
-Changes to the configuration file
-.B /etc/himmelblau/himmelblau.conf
+Changes to any of the configuration files described below
 only take effect after restarting the Himmelblau daemons. This includes the
 .B himmelblaud
 daemon, which handles authentication, and the
@@ -38,6 +41,29 @@ While Himmelblau is designed to be highly configurable, it can normally be used 
 .P
 Himmelblau has many capabilities, but most are enabled by default and configured automatically at install time. The options documented below allow administrators to customize behavior for specific environments or requirements.
 
+.SH CONFIGURATION PRECEDENCE
+Himmelblau looks for the main configuration file in the following locations, from lowest to highest priority:
+.IP \[bu] 2
+.B /usr/lib/himmelblau/himmelblau.conf
+.IP \[bu] 2
+.B /run/himmelblau/himmelblau.conf
+.IP \[bu] 2
+.B /etc/himmelblau/himmelblau.conf
+.P
+Only the highest-priority main file that exists is parsed. An empty higher-priority file or a symbolic link to
+.B /dev/null
+masks lower-priority main files.
+.P
+Drop-in files ending in
+.B .conf
+are read from directories formed by appending
+.B .d
+to each path above, for example
+.BR /etc/himmelblau/himmelblau.conf.d/ .
+Files with the same basename override each other according to the hierarchy priority. The remaining files are parsed in lexicographic basename order after the main file, so later names have higher priority. Empty files and symbolic links to
+.B /dev/null
+mask same-named drop-ins at lower priorities. Drop-ins are still parsed when the main file is masked, and drop-in directories are not recursive.
+
 .SH FILE FORMAT
 The file consists of sections headed by a name enclosed in square brackets. Each section contains parameters and their values in the format:
 .RS 4
@@ -60,6 +86,10 @@ match the domain name that users enter when signing in (for example, the domain 
 
 In most cases, this will be the primary domain of your Azure Entra ID tenant. If your organization uses multiple verified domains or aliases, choose the one that your users actually use to sign in.
 
+Only a single Entra ID domain is supported. If several domains are listed (comma-separated, or through additional domain sections), only the first one is used and the others are ignored. If
+.B oidc_issuer_url
+is set, this option is ignored.
+
 If not specified, the domain is extracted from the UPN of the first user to authenticate and looked up in Entra ID.
 
 .P
@@ -77,6 +107,16 @@ OIDC provider metadata and endpoints.
 This option enables generic OIDC authentication support and allows Himmelblau
 to authenticate against any standards-compliant OIDC provider, rather than
 using the built-in Microsoft Entra ID defaults.
+
+.PP
+Himmelblau prefers native Interaction Code authentication when supported by the
+configured client. It probes issuers with Okta metadata or hostname hints,
+issuers advertising the interaction_code grant, and issuers without a usable
+device authorization flow. Otherwise it uses the existing OIDC device flow.
+Selection lasts until daemon restart. Temporary outages defer selection.
+The absence of interaction_code in discovery does not prove it is disabled.
+Use oidc_force_interaction_code to require native authentication and
+oidc_redirect_uri to configure its registered redirect URI.
 
 .PP
 If
@@ -105,7 +145,7 @@ If this option is not set, Himmelblau defaults to its native Microsoft Entra ID
 authentication flow.
 
 .PP
-If
+When the standard OIDC backend is selected, if
 .B allow_console_password_only
 is enabled and the OIDC provider advertises the
 .B password
@@ -118,6 +158,96 @@ grant continue to use the device flow.
 
 .P
 Example: oidc_issuer_url = https://login.microsoftonline.com/0656e57d-a8fc-4aa4-8366-8045787115ca/v2.0
+
+.TP
+.B oidc_force_interaction_code
+.RE
+Require native Interaction Code (IDX) authentication for the configured OIDC
+issuer. When true, Himmelblau never falls back to device authorization or the
+browser orchestrator. The server must implement the compatible IDX protocol,
+and the configured public client must permit Interaction Code.
+.PP
+When false, Himmelblau probes likely compatible providers (including Okta) and
+issuers without device authorization, then falls back quietly when native
+authentication is unavailable. Selection is fixed until daemon restart;
+selection during a network outage is deferred until connectivity returns.
+
+.P
+Default: false
+
+.TP
+.B oidc_redirect_uri
+.RE
+Redirect URI supplied to native OIDC Interaction Code requests. Register this
+exact URI on the public OIDC application identified by app_id, or configure
+the URI already registered there. A URI without a fragment or embedded
+credentials is required.
+.PP
+Native PAM flows do not open a callback listener. Policies requiring a browser
+redirect or external callback must offer another supported native method;
+otherwise authentication reports that the external step is unsupported.
+
+.P
+Default: http://localhost:8765/callback
+
+.TP
+.B oidc_device_authorization_endpoint
+.RE
+Optional device authorization endpoint for generic OIDC providers that omit
+.B device_authorization_endpoint
+from their discovery metadata. The discovered endpoint is preferred when it
+is present. This option is used only when
+.B oidc_issuer_url
+is configured.
+
+.P
+Example: oidc_device_authorization_endpoint = https://idp.example.com/device/code
+
+.TP
+.B oidc_account_id_claims
+.RE
+A comma-separated, ordered list of OIDC userinfo claim names to use as the
+Linux account name for generic OIDC providers.
+
+When this option is set, Himmelblau tries each named claim in order and uses
+the first claim that is present as a non-empty string. The claim names are not
+limited to standard OpenID Connect claims; provider-specific userinfo claims
+may also be listed.
+
+If none of the configured claims match a non-empty string claim in userinfo,
+Himmelblau logs a warning and falls back to the default account-name selection:
+.B preferred_username
+first, then
+.B email.
+
+.P
+Example: oidc_account_id_claims = uid,username,preferred_username,email
+
+.TP
+.B oidc_account_id_strip_at_suffix
+.RE
+A boolean option that removes any suffix beginning with
+.B @
+from the OIDC account name selected by
+.B oidc_account_id_claims
+or by the default
+.B preferred_username
+then
+.B email
+fallback.
+
+This is useful when the selected OIDC claim is scoped, such as
+.B user@example.com,
+but the desired Linux account name is only the local portion.
+Only enable this when the remaining local portion is unique across all accepted
+OIDC issuers/domains; otherwise distinct identities that differ only by suffix
+can collide on the same Linux account name.
+
+.P
+Default: false
+
+.P
+Example: oidc_account_id_strip_at_suffix = true
 
 .TP
 .B debug
@@ -135,9 +265,19 @@ Example: debug = true
 .TP
 .B pam_allow_groups
 .RE
-A comma-separated list of Entra Id Users and Groups permitted to access the system. Users should be specified by UPN. Groups MUST be specified using their Object ID GUID. Group names may not be used because these names are not guaranteed to be unique in Entra Id.
+A comma-separated list of users and groups permitted to access the system.
+For Entra ID, users should be specified by UPN. Entra ID groups MUST be specified using their Object ID GUID. Group names may not be used because these names are not guaranteed to be unique in Entra ID.
+For generic OIDC providers, group and role entries may be specified by the exact value emitted in the userinfo groups, realm_access.roles, or resource_access roles claim.
 
-If not set, all Entra ID users are permitted to authenticate.
+If not set, all users are permitted to authenticate.
+
+This restriction is enforced during PAM account management: a user who is not
+permitted causes pam_himmelblau to return PAM_AUTH_ERR from its account phase.
+A PAM stack that discards that result (for example an account line whose
+control maps every non-success return to ignore) silently admits users that the
+allow list is meant to reject, because a later module such as pam_unix then
+succeeds for any resolvable user. When composing an account stack by hand,
+make sure the denial is terminal.
 
 .P
 Default: All users permitted
@@ -214,7 +354,7 @@ Enables or disables the use of a local Time-based One-Time Password (TOTP) in co
 
 The TOTP secret is enrolled and enforced locally on the host and is independent of any cloud-based MFA or identity provider. Users who have not yet enrolled a TOTP secret will be prompted to complete TOTP enrollment.
 
-Hello PIN alone is not permitted for remote authentication unless allow_remote_hello is enabled. When Hello TOTP is enabled, Hello + TOTP is accepted for remote services; otherwise remote logins skip Hello and require MFA.
+Hello PIN alone is not permitted for remote authentication unless allow_remote_hello is enabled. When Hello TOTP is enabled, Hello + TOTP is accepted for remote services; otherwise remote logins skip Hello and require MFA. The non-interactive PAM try_unseal option is incompatible with Hello TOTP. When this setting is enabled, try_unseal is refused before cached SSO material is loaded because the hook cannot collect a TOTP. Use the normal interactive Himmelblau authentication flow instead.
 
 .P
 Default: false
@@ -302,8 +442,9 @@ PAM_SERVICE \- If the service name matches entries in
 PAM_TTY \- If the terminal name contains "ssh" (fallback check)
 .RE
 
-This option requires the device to be domain-joined, matching the behavior of Microsoft-managed devices. Users can still
-use Hello PIN authentication if it is configured. To require MFA for all logins
+For Microsoft Entra ID, this option requires the device to be domain-joined,
+matching the behavior of Microsoft-managed devices. Users can still use Hello
+PIN authentication if it is configured. To require MFA for all logins
 (including local console), set this option to
 .B false.
 
@@ -314,9 +455,10 @@ When a generic OIDC provider is configured (see
 Password Credentials (ROPC) grant. It is only offered when the provider
 advertises the
 .B password
-grant type in its discovery document; providers that disable this grant fall
-back to the device-authorization (browser) flow. If the provider additionally
-requires MFA, authentication falls back to the device flow automatically.
+grant type in its discovery document and does not require the device to be
+domain-joined; providers that disable this grant fall back to the
+device-authorization (browser) flow. If the provider additionally requires MFA,
+authentication falls back to the device flow automatically.
 
 .P
 Default: true
@@ -367,9 +509,74 @@ Default: ssh,cockpit
 Example: mfa_poll_prompt_services = ssh,cockpit
 
 .TP
+.B canonicalize_user_services
+.RE
+A comma-separated list of PAM service names for which the PAM module replaces
+.B PAM_USER
+with the canonical account name after a successful authentication. The
+canonical account name is the name the system name service returns for the
+authenticated account, which is also the name reported by
+.B id -un
+for that user.
+
+Users can log in with several aliases of the same account, such as the UPN,
+the short name, or a different letter case. Some applications, such as GDM,
+copy
+.B PAM_USER
+into the
+.B USER
+and
+.B LOGNAME
+environment variables of the session, which then contain the alias entered at
+the login prompt instead of the account name.
+
+The PAM service name is the name passed by the application when calling
+.B pam_start()
+(e.g., "gdm-password", "login").
+
+Entries are matched as substrings, so "gdm" will match "gdm-password",
+"gdm-autologin", etc.
+
+.B PAM_USER
+is only replaced when the canonical account name resolves to the same account
+as the name entered at the login prompt.
+
+Do not list services that require
+.B PAM_USER
+to remain unchanged during authentication. sshd aborts the connection when it
+re-initializes PAM and
+.B PAM_USER
+has changed, and already sets
+.B USER
+and
+.B LOGNAME
+from the account name. polkit, whose PAM service is "polkit-1", rejects the
+authentication when
+.B PAM_USER
+has changed, even to the name of the same account.
+
+pam_faillock records failures under the value of
+.B PAM_USER
+at the time it runs. When pam_faillock runs before pam_himmelblau in the
+authentication stack, a successful login resets the failures recorded under
+the canonical account name, not those recorded under the name entered at the
+login prompt. When pam_himmelblau runs first, as configured by the authselect
+profile and by aad-tool configure-pam, pam_faillock does not act on successful
+Himmelblau logins, and this option does not change its behavior.
+
+By default, no service is listed and
+.B PAM_USER
+is never modified.
+
+.P
+Example: canonicalize_user_services = gdm-password
+
+.TP
 .B mfa_method
 .RE
-Specifies a preferred MFA (Multi-Factor Authentication) method to use during authentication. When set, Himmelblau will attempt to use this specific MFA method instead of the default method configured in the user's Entra ID profile. If not set or if the specified method is not available for the user, the default MFA method will be used.
+Specifies a preferred MFA (Multi-Factor Authentication) method to use during authentication. For Microsoft Entra ID, Himmelblau requests the named Entra method. For native Okta authentication, this option also accepts Okta remediation or method identifiers, such as challenge-authenticator, push, or otp. An exact Okta identifier takes precedence over the compatibility mappings below.
+
+When an Entra method has an Okta equivalent, Himmelblau maps it automatically: PhoneAppNotification and CompanionAppsNotification select Okta Verify push, while PhoneAppOTP selects an Okta verification code. If the configured value is unavailable or cannot be mapped, Himmelblau logs an error and continues with the identity provider's first policy-compliant method.
 
 Valid values include:
 .RS
@@ -389,6 +596,12 @@ TwoWayVoiceAlternateMobile - Phone call to alternate mobile number
 TwoWayVoiceOffice - Phone call to office
 .IP \(bu 2
 ConsolidatedTelephony - Call or text message
+.IP \(bu 2
+challenge-authenticator - Okta IDX authenticator challenge remediation
+.IP \(bu 2
+push - Okta Verify push notification
+.IP \(bu 2
+otp - Okta Verify verification code
 .RE
 
 .P
@@ -412,6 +625,39 @@ A comma-separated list of local groups that every Entra ID user should be a memb
 
 .P
 Example: local_groups = sudo,admin
+
+.TP
+.B initgroups_mode
+.RE
+Controls which supplementary groups Himmelblau returns from NSS initgroups.
+
+.RS
+.IP \(bu 2
+named \(em return only groups that resolve to an NSS name (default). A GID that
+.B getgrgid
+cannot name is omitted, so tools such as
+.B groups
+do not fail on an unnamed group id.
+.IP \(bu 2
+full \(em return every cached group GID, including ones with no NSS name. Use this when debugging a missing membership.
+.RE
+
+.P
+Default: named
+
+.P
+Example: initgroups_mode = <named|full>
+
+.TP
+.B local_groups_reconcile_interval
+.RE
+The interval in seconds for periodically reconciling configured local group membership for cached Entra ID users. This keeps the configured local sudo group in sync with sudo_groups between login attempts. Set to 0 to disable periodic reconciliation.
+
+.P
+Default: 300
+
+.P
+Example: local_groups_reconcile_interval = 300
 
 .TP
 .B sudo_groups
@@ -447,6 +693,17 @@ A script that will execute every time a user logs on. Two environment variables 
 Example: logon_script = /etc/himmelblau/logon.sh
 
 .TP
+.B logon_script_timeout
+.RE
+The timeout in seconds for the configured logon script. If the script does not finish before this timeout, authentication fails with a hard failure.
+
+.P
+Default: 60
+
+.P
+Example: logon_script_timeout = 120
+
+.TP
 .B logon_token_scopes
 .RE
 A comma-separated list of the scopes to be requested for the ACCESS_TOKEN during logon. These scopes
@@ -461,6 +718,12 @@ Example: logon_token_scopes = user.read,mail.read
 .TP
 .B app_id
 .RE
+When oidc_issuer_url is configured, this is the OIDC public client identifier.
+Native Interaction Code authentication requires that grant to be enabled for
+the authorization server and application, and oidc_redirect_uri to be registered
+on the application. No client secret is used.
+
+.PP
 Specifies the Azure Entra ID application (client) ID used by Himmelblau for directory operations such as reading extended attributes (for example,
 the
 .B gidNumber
@@ -619,14 +882,29 @@ Example: name_mapping_script = /path/to/mapping_script.sh
 .B apply_policy
 .RE
 A boolean option that enables the application and enforcement of Intune device compliance policies during non-OIDC authentication.
-When enabled (the default), non-compliant devices may be denied authentication in accordance with the configured policies.
+When enabled, non-compliant devices may be denied authentication in accordance with the configured policies.
 This setting does not affect OIDC-based authentication flows.
 
 .P
-Default: true
+Default: false
 
 .P
 Example: apply_policy = false
+
+.TP
+.B intune_auth_resource
+.RE
+A boolean option that makes Entra ID sign-in authenticate against the Microsoft Intune resource instead of the Microsoft Intune Enrollment resource.
+This applies to the user lookup and to interactive sign-in through the password and MFA flow, which also joins the device to Entra ID when it is not joined yet. A device code sign-in started directly is not affected; when the password and MFA flow falls back to a device code, the resulting token also targets the Microsoft Intune resource.
+Use this when Conditional Access policies treat the two resources differently, including on hosts that are not enrolled in Intune.
+This option does not enroll the device in Intune or apply Intune policies; apply_policy controls both.
+When apply_policy is enabled, the Microsoft Intune resource is always used and this option has no effect.
+
+.P
+Default: false
+
+.P
+Example: intune_auth_resource = true
 
 .TP
 .B authority_host
@@ -769,6 +1047,19 @@ Example: enable_passwordless = false
 .B home_prefix
 .RE
 The prefix to use for user home directories.
+On SELinux systems, a custom prefix must have a persistent file-context
+equivalence to /home before users' homes are created. This labels the prefix
+home_root_t and applies the normal home/content contexts to its whole subtree.
+For example:
+.nf
+sudo mkdir -p /home/entra
+sudo semanage fcontext -a -e /home "$(readlink -f /home/entra)"
+sudo restorecon -R "$(readlink -f /home/entra)"
+.fi
+Resolve the destination when /home is a symlink, such as on Aurora; retain
+/home as the equivalence source. Use the same setup for prefixes outside /home.
+Relabel only the configured prefix. Changing just its directory label with
+chcon does not provide the descendant file-context rules.
 
 .P
 Default: /home/
@@ -977,78 +1268,6 @@ Default: both
 
 .P
 Example: ip_version = ipv4-only
-
-.TP
-.B orchestrator_enabled
-.RE
-Enable use of the optional himmelblaud-orchestrator backend for browser-driven
-OIDC authentication flows.
-
-When enabled, OIDC interactive authentication can be delegated to the
-orchestrator over a Unix socket. If the orchestrator is unavailable or returns
-an error, Himmelblau falls back to the built-in device authorization grant
-(DAG) flow.
-
-.P
-Default: false
-
-.P
-Example: orchestrator_enabled = true
-
-.TP
-.B orchestrator_socket
-.RE
-Unix socket path used by himmelblaud to communicate with
-himmelblaud-orchestrator.
-
-This path must match the orchestrator service configuration.
-
-.P
-Default: /var/run/himmelblaud/orchestrator.sock
-
-.P
-Example: orchestrator_socket = /run/himmelblaud/orchestrator.sock
-
-.TP
-.B orchestrator_provider
-.RE
-Optional explicit provider key passed to himmelblaud-orchestrator when starting
-an OIDC browser flow.
-
-If unset, the orchestrator auto-detects the provider from issuer URL, domain,
-or embedded provider match rules.
-
-.P
-Example: orchestrator_provider = keycloak
-
-.TP
-.B orchestrator_timeout_secs
-.RE
-Timeout in seconds for a single request/response exchange with
-himmelblaud-orchestrator.
-
-This timeout applies to connect, send, and receive operations on the
-orchestrator Unix socket.
-
-.P
-Default: 30
-
-.P
-Example: orchestrator_timeout_secs = 10
-
-.TP
-.B orchestrator_poll_secs
-.RE
-Polling interval in seconds used for orchestrator-driven MFA wait prompts.
-
-This value controls how frequently PAM should poll the orchestrator for
-progress while waiting for external approvals (for example push MFA).
-
-.P
-Default: 2
-
-.P
-Example: orchestrator_poll_secs = 3
 
 .TP
 .B enable_kerberos_cache

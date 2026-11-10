@@ -18,10 +18,6 @@ fn default_true() -> bool {
     true
 }
 
-fn is_true(value: &bool) -> bool {
-    *value
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NssUser {
     pub name: String,
@@ -30,6 +26,9 @@ pub struct NssUser {
     pub gecos: String,
     pub homedir: String,
     pub shell: String,
+    /// Lookup-only identities must not enter the NSS fallback cache.
+    #[serde(default = "default_true")]
+    pub cacheable: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -37,6 +36,27 @@ pub struct NssGroup {
     pub name: String,
     pub gid: u32,
     pub members: Vec<String>,
+}
+
+/// Enrollment material is as sensitive as a password until setup is complete.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct EnrollmentPresentation {
+    pub qr: Option<String>,
+    pub setup_key: Option<String>,
+}
+
+impl std::fmt::Debug for EnrollmentPresentation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnrollmentPresentation { [redacted] }")
+    }
+}
+
+impl Drop for EnrollmentPresentation {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.qr.zeroize();
+        self.setup_key.zeroize();
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -53,6 +73,8 @@ pub enum PamAuthResponse {
     /// PAM must prompt for a generic input value.
     #[serde(alias = "MFACode")]
     Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enrollment: Option<EnrollmentPresentation>,
         msg: String,
         #[serde(default)]
         echo_on: bool,
@@ -63,12 +85,17 @@ pub enum PamAuthResponse {
     },
     /// PAM will poll for an external response
     MFAPoll {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enrollment: Option<EnrollmentPresentation>,
         /// Initial message to display as the polling begins.
         msg: String,
         /// Seconds between polling attempts.
         polling_interval: u32,
         /// Whether PAM should append push-notification troubleshooting text.
-        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        #[serde(
+            default = "default_true",
+            skip_serializing_if = "std::clone::Clone::clone"
+        )]
         show_push_hint: bool,
     },
     MFAPollWait,
@@ -83,6 +110,14 @@ pub enum PamAuthResponse {
         fido_allow_list: Vec<String>,
         has_physical_security_key: bool,
         has_cross_device: bool,
+    },
+    /// Provider-neutral WebAuthn. Options contain only public authenticator data.
+    WebAuthn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enrollment: Option<EnrollmentPresentation>,
+        operation: WebAuthnOperation,
+        origin: String,
+        options: serde_json::Value,
     },
     /// PAM must prompt for a new password and confirm that password input
     ChangePassword {
@@ -107,7 +142,12 @@ impl PamAuthResponse {
                 prompt: prompt.map(|msg| i18n::translate_external_message(&msg)),
                 long_prompt: long_prompt.map(|msg| i18n::translate_external_message(&msg)),
             },
-            PamAuthResponse::Input { msg, echo_on } => PamAuthResponse::Input {
+            PamAuthResponse::Input {
+                enrollment,
+                msg,
+                echo_on,
+            } => PamAuthResponse::Input {
+                enrollment,
                 msg: i18n::translate_external_message(&msg),
                 echo_on,
             },
@@ -115,10 +155,12 @@ impl PamAuthResponse {
                 msg: i18n::translate_external_message(&msg),
             },
             PamAuthResponse::MFAPoll {
+                enrollment,
                 msg,
                 polling_interval,
                 show_push_hint,
             } => PamAuthResponse::MFAPoll {
+                enrollment,
                 msg: i18n::translate_external_message(&msg),
                 polling_interval,
                 show_push_hint,
@@ -137,6 +179,7 @@ impl PamAuthResponse {
             | PamAuthResponse::MFAPollWait
             | PamAuthResponse::Pin
             | PamAuthResponse::Fido { .. } => self,
+            PamAuthResponse::WebAuthn { .. } => self,
         }
     }
 }
@@ -168,6 +211,16 @@ pub enum PamAuthRequest {
     /// FIDO hardware is unavailable (no USB key, no Bluetooth for cross-device).
     /// The daemon should fall back to password authentication.
     FidoUnavailable,
+    WebAuthn {
+        response: serde_json::Value,
+    },
+    WebAuthnUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WebAuthnOperation {
+    Get,
+    Create,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -266,7 +319,7 @@ pub enum TaskRequest {
     HomeDirectory(HomeDirectoryInfo),
     LocalGroups(String, bool),
     LogonScript(String, String),
-    KerberosConfig(Option<String>, Option<String>),
+    KerberosConfig(Option<String>, Option<String>, Option<String>),
     KerberosTGTs(
         uid_t,
         uid_t,
@@ -332,7 +385,11 @@ fn test_legacy_mfa_code_response_defaults_to_hidden_input() {
     let response: PamAuthResponse = serde_json::from_str(r#"{"MFACode":{"msg":"Code:"}}"#).unwrap();
 
     match response {
-        PamAuthResponse::Input { msg, echo_on } => {
+        PamAuthResponse::Input {
+            enrollment: _,
+            msg,
+            echo_on,
+        } => {
             assert_eq!(msg, "Code:");
             assert!(!echo_on);
         }
@@ -368,6 +425,7 @@ fn test_legacy_mfa_poll_response_defaults_to_push_hint() {
 
     match response {
         PamAuthResponse::MFAPoll {
+            enrollment: _,
             msg,
             polling_interval,
             show_push_hint,
@@ -383,6 +441,7 @@ fn test_legacy_mfa_poll_response_defaults_to_push_hint() {
 #[test]
 fn test_mfa_poll_response_preserves_push_hint_opt_out() {
     let response = PamAuthResponse::MFAPoll {
+        enrollment: None,
         msg: "Waiting for browser authentication to complete...".to_string(),
         polling_interval: 2,
         show_push_hint: false,
@@ -392,6 +451,7 @@ fn test_mfa_poll_response_preserves_push_hint_opt_out() {
 
     match decoded {
         PamAuthResponse::MFAPoll {
+            enrollment: _,
             msg,
             polling_interval,
             show_push_hint,
@@ -412,4 +472,32 @@ fn test_legacy_mfa_code_request_aliases_to_input() {
         PamAuthRequest::Input { cred } => assert_eq!(cred, "123456"),
         other => panic!("expected Input request, got {:?}", other),
     }
+}
+
+#[test]
+fn enrollment_round_trip_and_translation_preserve_redacted_material() {
+    let response = PamAuthResponse::Input {
+        msg: "Enter code".into(),
+        echo_on: false,
+        enrollment: Some(EnrollmentPresentation {
+            qr: Some("data:image/png;base64,fixture".into()),
+            setup_key: Some("SECRETKEY".into()),
+        }),
+    };
+    assert!(!format!("{response:?}").contains("SECRETKEY"));
+    assert!(!format!("{response:?}").contains("base64"));
+    let encoded = serde_json::to_string(&response).unwrap();
+    let decoded: PamAuthResponse = serde_json::from_str(&encoded).unwrap();
+    let PamAuthResponse::Input {
+        enrollment: Some(presentation),
+        ..
+    } = decoded.translate_user_visible()
+    else {
+        panic!("missing enrollment");
+    };
+    assert_eq!(presentation.setup_key.as_deref(), Some("SECRETKEY"));
+    assert_eq!(
+        presentation.qr.as_deref(),
+        Some("data:image/png;base64,fixture")
+    );
 }
