@@ -3,7 +3,7 @@ SHELL := /usr/bin/env bash
 all: .packaging dockerfiles ## Auto-detect host distro and build packages just for this host
 	@set -euo pipefail; \
 	. /etc/os-release; \
-	ID="$$ID"; VER="$$VERSION_ID"; LIKE="$${ID_LIKE:-}"; \
+	ID="$$ID"; VER="$${VERSION_ID:-}"; LIKE="$${ID_LIKE:-}"; \
 	TARGET=""; \
 	echo "Detecting host distro: ID=$$ID VERSION_ID=$$VER ID_LIKE=$$LIKE"; \
 	\
@@ -40,19 +40,22 @@ all: .packaging dockerfiles ## Auto-detect host distro and build packages just f
 	    esac ;; \
 	  sles|sled|sle_micro|suse|suse-linux-enterprise) \
 	    case "$$VER" in \
-	      15.6*|15-SP6*) TARGET="sle15sp6" ;; \
 	      15.7*|15-SP7*) TARGET="sle15sp7" ;; \
 	      16*|16.*) TARGET="sle16" ;; \
 	    esac ;; \
 	  opensuse-leap) \
 	    case "$$VER" in \
-	      15.6*) TARGET="sle15sp6" ;; \
 	      15.7*) TARGET="sle15sp7" ;; \
 	    esac ;; \
 	  opensuse-tumbleweed) TARGET="tumbleweed" ;; \
 	  gentoo)         TARGET="gentoo" ;; \
+	  arch|archlinux|manjaro|cachyos) TARGET="arch" ;; \
 	  amzn)          case "$$VER" in 2023) TARGET="amzn2023" ;; esac ;; \
 	esac; \
+	\
+	if [ -z "$$TARGET" ] && command -v pacman >/dev/null 2>&1; then \
+	  TARGET="arch"; \
+	fi; \
 	\
 	if [ -z "$$TARGET" ]; then \
 	  echo "Error: unsupported or unmapped distro: $$ID $$VER"; \
@@ -68,13 +71,29 @@ all: .packaging dockerfiles ## Auto-detect host distro and build packages just f
 	$(MAKE) $$TARGET; \
 	echo "Packages written to ./packaging/"
 
-test: dockerfiles ## Run cargo tests in a container
+test: test-hsm-pin-init test-daemon-postinst test-cargo-vet-review test-build-options dockerfiles ## Run shell regressions and cargo tests in a container
 	mkdir -p target/test
 	$(DOCKER) build -t himmelblau-test-build -f images/Dockerfile.test .
 	$(DOCKER) run --rm --security-opt label=disable -it \
                 -v $(CURDIR):/himmelblau \
 		-v $(CURDIR)/target/test:/himmelblau/target \
                 himmelblau-test-build
+
+.PHONY: test-hsm-pin-init
+test-hsm-pin-init: ## Run isolated HSM PIN initializer regressions
+	python3 scripts/test_hsm_pin_init.py
+
+.PHONY: test-daemon-postinst
+test-daemon-postinst: ## Run isolated daemon post-install regressions
+	python3 scripts/test_daemon_postinst.py
+
+.PHONY: test-cargo-vet-review
+test-cargo-vet-review: ## Run offline cargo-vet review assistant regressions
+	python3 scripts/test_cargo_vet_review.py
+
+.PHONY: test-build-options
+test-build-options: ## Run isolated package and configuration generator regressions
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_gen_dockerfiles.py scripts/test_gen_dockerfiles_orchestrator.py scripts/test_orchestrator_config_options.py
 
 test-selinux: ## Test the SELinux policy to ensure it builds
 	./scripts/test_selinux_policy.py --fix -v --distros rocky8,rocky9,rocky10,fedora43,fedora44,tumbleweed,sle16
@@ -98,6 +117,8 @@ DOCKER := $(shell command -v podman || command -v docker)
 NIX := $(shell command -v nix)
 ORCHESTRATOR_CONTAINER_IMAGE ?= localhost/himmelblau/playwright-orchestrator:latest
 ORCHESTRATOR_CONTAINER_DIRECTORY ?= src/orchestrator/container
+export WITH_ORCHESTRATOR ?= 0
+ORCHESTRATOR_FLAG := $(if $(filter 1,$(WITH_ORCHESTRATOR)),--with-orchestrator,)
 
 # Optional: Mount local libhimmelblau for development testing
 # Usage: LIBHIMMELBLAU_LOCAL=/path/to/libhimmelblau make ubuntu24.04
@@ -124,9 +145,10 @@ nix: .packaging ## Build Nix packages into ./packaging/
 
 DEB_TARGETS := ubuntu22.04 ubuntu24.04 ubuntu25.10 ubuntu26.04 debian12 debian13
 RPM_TARGETS := rocky8 rocky9 rocky10 tumbleweed rawhide fedora43 fedora44 amzn2023
-SLE_TARGETS := sle15sp6 sle15sp7 sle16
+SLE_TARGETS := sle15sp7 sle16
 GENTOO_TARGETS := gentoo
-ALL_PACKAGE_TARGETS := $(DEB_TARGETS) $(RPM_TARGETS) $(SLE_TARGETS) $(GENTOO_TARGETS)
+ARCH_TARGETS := arch
+ALL_PACKAGE_TARGETS := $(DEB_TARGETS) $(RPM_TARGETS) $(SLE_TARGETS) $(GENTOO_TARGETS) $(ARCH_TARGETS)
 
 # ARM64 (aarch64) targets — rocky8 excluded (EOL, no aarch64 builds)
 DEB_ARM64_TARGETS := $(addprefix arm64-,$(DEB_TARGETS))
@@ -134,10 +156,10 @@ RPM_ARM64_TARGETS := $(addprefix arm64-,$(filter-out rocky8,$(RPM_TARGETS)))
 SLE_ARM64_TARGETS := $(addprefix arm64-,$(SLE_TARGETS))
 ALL_ARM64_TARGETS := $(DEB_ARM64_TARGETS) $(RPM_ARM64_TARGETS) $(SLE_ARM64_TARGETS)
 
-install: ## Install packages from ./packaging onto this host (apt/dnf/yum/zypper auto-detected)
+install: ## Install packages from ./packaging onto this host (apt/dnf/yum/zypper/pacman auto-detected)
 	@set -euo pipefail; \
 	. /etc/os-release; \
-	ID="$${ID}"; VER="$${VERSION_ID}"; \
+	ID="$${ID}"; \
 	PKGTYPE=""; RPM_SUFFIX=""; INSTALL_CMD=""; \
 	case "$$ID" in \
 	  ubuntu|linuxmint|debian) \
@@ -148,18 +170,25 @@ install: ## Install packages from ./packaging onto this host (apt/dnf/yum/zypper
 		                            (command -v zypper >/dev/null && zypper --non-interactive --no-gpg-checks in ./packaging/*.rpm)';; \
 	  gentoo) \
 		PKGTYPE="gentoo"; INSTALL_CMD='python3 scripts/install_local.py --no-build --destdir $(DESTDIR)/';; \
+	  arch|archlinux|manjaro|cachyos) \
+		PKGTYPE="arch"; INSTALL_CMD='pacman -U --noconfirm ./packaging/himmelblau-[0-9]*.pkg.tar.zst';; \
 	esac; \
+	if [ -z "$$PKGTYPE" ] && command -v pacman >/dev/null 2>&1; then \
+		PKGTYPE="arch"; INSTALL_CMD='pacman -U --noconfirm ./packaging/himmelblau-[0-9]*.pkg.tar.zst'; \
+	fi; \
 	if [ -z "$$PKGTYPE" ]; then echo "Error: unknown distro family for install"; exit 2; fi; \
 	if [ "$$PKGTYPE" = "deb" ]; then \
 	  ls ./packaging/*.deb >/dev/null 2>&1 || { echo "Error: no .deb packages in ./packaging/ — run 'make' first"; exit 4; }; \
 	elif [ "$$PKGTYPE" = "rpm" ]; then \
 	  ls ./packaging/*.rpm >/dev/null 2>&1 || { echo "Error: no .rpm packages in ./packaging/ — run 'make' first"; exit 4; }; \
+	elif [ "$$PKGTYPE" = "arch" ]; then \
+	  ls ./packaging/himmelblau-[0-9]*.pkg.tar.zst >/dev/null 2>&1 || { echo "Error: no Arch core package in ./packaging/ — run 'make arch' first"; exit 4; }; \
 	fi; \
 	echo "Installing..."; \
 	sh -c "$$INSTALL_CMD"; \
 	echo "Install complete."
 
-uninstall: ## Uninstall Himmelblau packages from this host (apt/dnf/yum/zypper auto-detected)
+uninstall: ## Uninstall Himmelblau packages from this host (apt/dnf/yum/zypper/pacman auto-detected)
 	@set -e; \
 	PM=""; PKGTYPE=""; \
 	if command -v apt-get >/dev/null 2>&1; then \
@@ -170,19 +199,37 @@ uninstall: ## Uninstall Himmelblau packages from this host (apt/dnf/yum/zypper a
 		PKGTYPE="rpm"; PM="sudo yum remove -y"; \
 	elif command -v zypper >/dev/null 2>&1; then \
 		PKGTYPE="rpm"; PM="sudo zypper rm -y"; \
+	elif command -v pacman >/dev/null 2>&1; then \
+		PKGTYPE="arch"; PM="sudo pacman -Rns --noconfirm"; \
 	else \
-		echo "Error: no supported package manager found (apt/dnf/yum/zypper)."; exit 2; \
+		echo "Error: no supported package manager found (apt/dnf/yum/zypper/pacman)."; exit 2; \
 	fi; \
-	pkgs="himmelblau himmelblau-orchestrator himmelblau-apparmor himmelblau-broker himmelblau-qr-greeter himmelblau-selinux himmelblau-sshd-config himmelblau-sso himmelblau-sso-policies nss-himmelblau pam-himmelblau"; \
+	if [ "$$PKGTYPE" = "arch" ]; then \
+		pkgs="himmelblau"; \
+		installed=$$(pacman -Qq) || { echo "Error: cannot query installed Arch packages."; exit 1; }; \
+		if printf '%s\n' "$$installed" | grep -Fxq himmelblau-collabora; then \
+			sudo env -u DPKG_ROOT sh src/collabora/platform/prerm remove; \
+			pkgs="$$pkgs himmelblau-collabora"; \
+		fi; \
+	else \
+		pkgs="himmelblau himmelblau-orchestrator himmelblau-apparmor himmelblau-broker himmelblau-qr-greeter himmelblau-selinux himmelblau-sshd-config himmelblau-sso himmelblau-sso-policies nss-himmelblau pam-himmelblau"; \
+		if [ "$$PKGTYPE" = "deb" ]; then \
+			installed=$$(dpkg-query -W -f='$${Package} $${db:Status-Status}\n') || { echo "Error: cannot query installed Debian packages."; exit 1; }; \
+			if printf '%s\n' "$$installed" | awk '$$1 == "himmelblau-collabora" && $$2 != "not-installed" && $$2 != "config-files" { found = 1 } END { exit !found }'; then pkgs="$$pkgs himmelblau-collabora"; fi; \
+		else \
+			installed=$$(rpm -qa --qf '%{NAME}\n') || { echo "Error: cannot query installed RPM packages."; exit 1; }; \
+			if printf '%s\n' "$$installed" | grep -Fxq himmelblau-collabora; then pkgs="$$pkgs himmelblau-collabora"; fi; \
+		fi; \
+	fi; \
 	echo "Removing: $$pkgs"; \
 	$$PM $$pkgs; \
 	echo "Uninstall complete."
 
 dockerfiles:
-	python3 scripts/gen_dockerfiles.py --out ./images/ $(PATCH_LIBHIMMELBLAU)
+	python3 scripts/gen_dockerfiles.py --out ./images/ $(PATCH_LIBHIMMELBLAU) $(ORCHESTRATOR_FLAG)
 
 dockerfiles-arm64:
-	python3 scripts/gen_dockerfiles.py --out ./images/ --arch arm64 $(PATCH_LIBHIMMELBLAU)
+	python3 scripts/gen_dockerfiles.py --out ./images/ --arch arm64 $(PATCH_LIBHIMMELBLAU) $(ORCHESTRATOR_FLAG)
 
 orchestrator-container: ## Build the local orchestrator Playwright container image
 	pushd $(ORCHESTRATOR_CONTAINER_DIRECTORY) && $(DOCKER) build -t $(ORCHESTRATOR_CONTAINER_IMAGE) .
@@ -196,16 +243,16 @@ rpm-servicefiles:
 authselect:
 	python3 ./scripts/gen_authselect.py --root=./ --aad-tool=./target/release/aad-tool --output-dir=./platform/el/authselect/
 
-.PHONY: package deb rpm $(DEB_TARGETS) $(RPM_TARGETS) ${SLE_TARGETS} $(GENTOO_TARGETS) dockerfiles dockerfiles-arm64 orchestrator-container deb-servicefiles rpm-servicefiles authselect conf-examples install uninstall help sbom man arm64 deb-arm64 rpm-arm64 $(ALL_ARM64_TARGETS)
+.PHONY: package deb rpm $(DEB_TARGETS) $(RPM_TARGETS) ${SLE_TARGETS} $(GENTOO_TARGETS) $(ARCH_TARGETS) dockerfiles dockerfiles-arm64 orchestrator-container deb-servicefiles rpm-servicefiles authselect conf-examples install uninstall help sbom man arm64 deb-arm64 rpm-arm64 $(ALL_ARM64_TARGETS)
 
 check-licenses: ## Validate dependant licenses comply with GPLv3
 	cargo deny -V >/dev/null || (echo "cargo-deny required" && cargo install cargo-deny)
 	cargo deny --all-features check licenses
 
 vet: ## Interactive dependency review with AI analysis
-	/usr/bin/cargo vet -V >/dev/null || (echo "cargo-vet required" && cargo install cargo-vet)
-	/usr/bin/cargo vet regenerate imports
-	@python3 scripts/cargo_vet_review.py --ai-provider claude
+	cargo vet -V >/dev/null || (echo "cargo-vet required" && cargo install cargo-vet)
+	cargo vet regenerate imports
+	@python3 scripts/cargo_vet_review.py
 
 sbom: .packaging ## Generate a Software Bill of Materials
 	cargo sbom -V >/dev/null || (echo "cargo-sbom required" && cargo install cargo-sbom)
@@ -231,12 +278,13 @@ package: deb rpm sbom ## Build packages for all supported distros (DEB+RPM)
 	ls ./packaging/
 
 man: ## Generate the himmelblau.conf man page
-	python3 src/common/scripts/gen_param_code.py --gen-man --man-output man/man5/himmelblau.conf.5
+	python3 src/common/scripts/gen_param_code.py --gen-man --man-output man/man5/himmelblau.conf.5 $(ORCHESTRATOR_FLAG)
 
 conf-examples: ## Generate himmelblau.conf example files
 	python3 src/common/scripts/gen_param_code.py \
 		--gen-conf-example --conf-example-output target/config/himmelblau.conf.example \
-		--gen-debian-conf-example --debian-conf-example-output target/debian/himmelblau.conf.example
+		--gen-debian-conf-example --debian-conf-example-output target/debian/himmelblau.conf.example \
+		$(ORCHESTRATOR_FLAG)
 
 # ---- failure tracking (used by deb/rpm/package) ----
 FAIL_DIR := $(CURDIR)/target/fail
@@ -357,7 +405,7 @@ $(RPM_TARGETS): %: .packaging dockerfiles
 $(SLE_TARGETS): %: .packaging dockerfiles
 	@echo "Building $@ SLE RPM packages"
 	mkdir -p target/$@
-	$(DOCKER) build --secret id=scc_regcode,src=${HOME}/.secrets/scc_regcode $(LIBHIMMELBLAU_BUILD_ARG) -t himmelblau-$@-build -f images/Dockerfile.$@ .
+	$(DOCKER) build $(LIBHIMMELBLAU_BUILD_ARG) -t himmelblau-$@-build -f images/Dockerfile.$@ .
 	$(DOCKER) run --rm --security-opt label=disable -it \
 		-v $(CURDIR):/himmelblau \
 		-v $(CURDIR)/target/$@:/himmelblau/target \
@@ -383,6 +431,16 @@ $(GENTOO_TARGETS): %: .packaging dockerfiles
 	cargo build --release --features tpm
 	strip -s target/release/*.so 2>/dev/null || true
 	strip -s target/release/aad-tool target/release/himmelblaud target/release/himmelblaud_tasks target/release/broker target/release/linux-entra-sso 2>/dev/null || true
+
+$(ARCH_TARGETS): %: .packaging dockerfiles
+	@echo "Building $@ package"
+	mkdir -p target/$@
+	$(DOCKER) build $(LIBHIMMELBLAU_BUILD_ARG) -t himmelblau-$@-build -f images/Dockerfile.$@ .
+	$(DOCKER) run --rm --security-opt label=disable \
+		-v $(CURDIR):/himmelblau \
+		-v $(CURDIR)/target/$@:/himmelblau/target \
+		$(LIBHIMMELBLAU_MOUNT) \
+		himmelblau-$@-build
 
 # ---- ARM64 (aarch64) build targets -------------------------------------------
 # Uses docker buildx with QEMU emulation to build natively for arm64.
@@ -483,7 +541,7 @@ $(SLE_ARM64_TARGETS): arm64-%: .packaging dockerfiles-arm64
 	@distro=$*; \
 	echo "Building ARM64 $$distro SLE RPM packages"; \
 	mkdir -p target/arm64-$$distro
-	$(DOCKER_BUILDX) --secret id=scc_regcode,src=${HOME}/.secrets/scc_regcode \
+	$(DOCKER_BUILDX) \
 		$(LIBHIMMELBLAU_BUILD_ARG) \
 		-t himmelblau-arm64-$*-build \
 		-f images/Dockerfile.$*.arm64 .
