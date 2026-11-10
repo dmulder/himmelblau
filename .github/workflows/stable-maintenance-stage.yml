@@ -130,8 +130,11 @@ jobs:
           set-safe-directory: false
 
       - name: Test trusted automation before repository mutation
+        if: ${{ inputs.stage == 'dependencies' }}
         # Temporary Git fixtures own their main refs; the job's immutable
         # snapshot applies to real maintenance phases, not fixture repositories.
+        # Later stages reuse the same run's pinned tooling; dependencies already
+        # validated it and resume verifies the checkpoint digest before mutation.
         run: env -u MAINTENANCE_TOOLING_COMMIT python3 tooling/.github/scripts/test_stable_maintenance.py
 
       - name: Initialize hardened Git configuration and exact refs
