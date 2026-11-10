@@ -22,8 +22,8 @@
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{symlink, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::process::ExitCode;
 use std::str;
 use std::time::Duration;
@@ -33,9 +33,11 @@ use bytes::{BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
 use himmelblau::graph::Graph;
 use himmelblau_policies::policies::apply_intune_policy;
+use himmelblau_policies::scripts_ext::restore_configuration_policies;
 use himmelblau_unix_common::config::{split_username, HimmelblauConfig};
 use himmelblau_unix_common::constants::{DEFAULT_CONFIG_PATH, DEFAULT_KERBEROS_CONF_DIR};
 use himmelblau_unix_common::unix_proto::{HomeDirectoryInfo, TaskRequest, TaskResponse};
+use himmelblau_unix_common::user_map::UserMap;
 use kanidm_utils_users::{get_effective_gid, get_effective_uid};
 use libc::uid_t;
 use libc::{lchown, umask};
@@ -47,17 +49,37 @@ use sketching::tracing_forest::{self};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
+use tempfile::NamedTempFile;
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
 use tokio::time;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing::span;
 use walkdir::WalkDir;
+use zbus::{proxy, Connection, OwnedObjectPath};
 
 #[cfg(all(target_family = "unix", feature = "selinux"))]
 use himmelblau_unix_common::selinux_util;
 
 struct TaskCodec;
+
+#[proxy(
+    interface = "org.freedesktop.Accounts",
+    default_service = "org.freedesktop.Accounts",
+    default_path = "/org/freedesktop/Accounts"
+)]
+trait AccountsService {
+    fn find_user_by_name(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
+    fn cache_user(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
+}
+
+#[proxy(
+    interface = "org.freedesktop.Accounts.User",
+    default_service = "org.freedesktop.Accounts"
+)]
+trait AccountsServiceUser {
+    fn set_icon_file(&self, filename: &str) -> zbus::Result<()>;
+}
 
 impl Decoder for TaskCodec {
     type Error = io::Error;
@@ -82,7 +104,7 @@ impl Encoder<TaskResponse> for TaskCodec {
         debug!("Attempting to send request -> {:?} ...", msg);
         let data = serde_json::to_vec(&msg).map_err(|e| {
             error!("socket encoding error -> {:?}", e);
-            io::Error::new(io::ErrorKind::Other, "JSON encode error")
+            io::Error::other("JSON encode error")
         })?;
         dst.put(data.as_slice());
         Ok(())
@@ -264,6 +286,10 @@ fn add_user_to_group(account_id: &str, local_group: &str) {
     }
 }
 
+fn group_members_include(users: &str, account_id: &str) -> bool {
+    users.split(',').any(|user| user.trim() == account_id)
+}
+
 fn user_in_group(account_id: &str, local_group: &str) -> bool {
     let output = Command::new("getent")
         .arg("group")
@@ -274,7 +300,7 @@ fn user_in_group(account_id: &str, local_group: &str) -> bool {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if let Some(users) = stdout.split(':').nth(3) {
-                return users.split(',').any(|u| u == account_id);
+                return group_members_include(users, account_id);
             }
         }
     }
@@ -355,6 +381,29 @@ fn user_has_subid_entry(username: &str, subid_file: &Path) -> bool {
     }
 }
 
+/// Reject account names that could forge additional records in a subid file.
+///
+/// /etc/subuid and /etc/subgid are newline separated `name:start:count`
+/// records. An account name containing the field separator (`:`) or a record
+/// separator (any control character, which covers `\n`, `\r` and NUL) would
+/// let a single delegation request write arbitrary *additional* delegations,
+/// e.g. `padding:1:2\nattacker:0:65536\npad` grants host UID 0 to `attacker`.
+/// See GHSA-x259-23ph-65m5.
+fn validate_subid_username(username: &str) -> Result<(), String> {
+    if username.is_empty() {
+        return Err("Refusing subordinate ID entry for an empty account name".to_string());
+    }
+
+    if let Some(c) = username.chars().find(|c| *c == ':' || c.is_control()) {
+        return Err(format!(
+            "Refusing subordinate ID entry for account name {:?}: illegal character {:?}",
+            username, c
+        ));
+    }
+
+    Ok(())
+}
+
 /// Add a subordinate ID entry to /etc/subuid or /etc/subgid
 /// Format: username:start:count
 fn add_subid_entry(
@@ -363,6 +412,9 @@ fn add_subid_entry(
     count: u32,
     subid_file: &Path,
 ) -> Result<(), String> {
+    // Never interpolate an unvalidated name into a subid record.
+    validate_subid_username(username)?;
+
     // Check if user already has an entry
     if user_has_subid_entry(username, subid_file) {
         debug!(
@@ -407,6 +459,113 @@ fn setup_subordinate_ids(username: &str, start: u32, count: u32) -> Result<(), S
     // Add entry to /etc/subgid (same range)
     add_subid_entry(username, start, count, subgid_path)?;
 
+    Ok(())
+}
+
+async fn set_accountsservice_icon(account_id: &str, icon_path: &Path) -> zbus::Result<()> {
+    let connection = Connection::system().await?;
+    let accounts = AccountsServiceProxy::new(&connection).await?;
+    let user_path = match accounts.find_user_by_name(account_id).await {
+        Ok(path) => path,
+        Err(err) => {
+            debug!(
+                ?err,
+                account_id, "AccountsService FindUserByName failed; falling back to CacheUser"
+            );
+            accounts.cache_user(account_id).await?
+        }
+    };
+    let user = AccountsServiceUserProxy::builder(&connection)
+        .path(user_path)
+        .build()
+        .await?;
+
+    user.set_icon_file(icon_path.to_string_lossy().as_ref())
+        .await
+}
+
+fn create_profile_photo_temp_file(icons_dir: &Path) -> io::Result<NamedTempFile> {
+    let file = NamedTempFile::new_in(icons_dir)?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn resolve_profile_photo_account_id(cfg: &HimmelblauConfig, upn: &str) -> String {
+    let user_map = UserMap::new(&cfg.get_user_map_file());
+    user_map
+        .get_local_from_upn(&upn.to_lowercase())
+        .unwrap_or_else(|| cfg.map_upn_to_name(upn))
+}
+
+#[cfg(test)]
+fn profile_photo_task_response(outcome: Result<(), String>) -> TaskResponse {
+    match outcome {
+        Ok(()) => TaskResponse::Success(0),
+        Err(e) => TaskResponse::Error(e),
+    }
+}
+
+async fn load_profile_photo(
+    cfg: &HimmelblauConfig,
+    upn: &str,
+    access_token: &str,
+) -> Result<(), String> {
+    let icons_dir = Path::new("/var/lib/AccountsService/icons/");
+    if !icons_dir.exists() {
+        return Err(format!(
+            "Profile photo directory '{}' doesn't exist",
+            icons_dir.display()
+        ));
+    }
+
+    let domain = split_username(upn)
+        .map(|(_, domain)| domain)
+        .ok_or_else(|| format!("Couldn't parse domain from UPN '{upn}'"))?;
+
+    // Resolve mapped UPNs back to the local account that owns the avatar.
+    let account_id = resolve_profile_photo_account_id(cfg, upn);
+
+    // Reject invalid account identifiers before resolving them through
+    // AccountsService. Stripping characters could select a different user.
+    if account_id.is_empty()
+        || !account_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "Invalid account_id '{account_id}' for profile photo - disallowed characters"
+        ));
+    }
+
+    let profile_photo = create_profile_photo_temp_file(icons_dir)
+        .map_err(|e| format!("Failed creating profile photo: {e:?}"))?;
+    let file = profile_photo
+        .reopen()
+        .map_err(|e| format!("Failed opening profile photo: {e:?}"))?;
+    let authority_host = cfg.get_authority_host(domain);
+    let tenant_id = cfg.get_tenant_id(domain);
+    let graph_url = cfg.get_graph_url(domain);
+    let ip_versions = cfg.get_ip_versions();
+    let request_timeout = cfg.get_request_timeout();
+    let graph = Graph::new(
+        &cfg.get_odc_provider(domain),
+        domain,
+        Some(&authority_host),
+        tenant_id.as_deref(),
+        graph_url.as_deref(),
+        Duration::from_secs(request_timeout),
+        &ip_versions,
+    )
+    .await
+    .map_err(|e| format!("Failed creating Graph client: {e:?}"))?;
+    graph
+        .fetch_user_profile_photo(access_token, file)
+        .await
+        .map_err(|e| format!("Failed fetching profile photo: {e:?}"))?;
+    set_accountsservice_icon(&account_id, profile_photo.path())
+        .await
+        .map_err(|e| format!("Failed updating AccountsService profile photo: {e:?}"))?;
     Ok(())
 }
 
@@ -457,6 +616,21 @@ fn store_tgt(tgt: &KerberosCredentials, uid: uid_t, gid: uid_t) -> Result<(), St
 fn write_kerberos_config_snippet(
     top_level_names: Option<String>,
     tenant_id: &str,
+    authority_host: &str,
+) -> Result<(), String> {
+    write_kerberos_config_snippet_to(
+        top_level_names,
+        tenant_id,
+        authority_host,
+        Path::new(DEFAULT_KERBEROS_CONF_DIR),
+    )
+}
+
+fn write_kerberos_config_snippet_to(
+    top_level_names: Option<String>,
+    tenant_id: &str,
+    authority_host: &str,
+    krb_conf_dir: &Path,
 ) -> Result<(), String> {
     if tenant_id.is_empty() {
         return Err("Failed to write Kerberos config snippet, empty tenant_id".to_string());
@@ -465,13 +639,12 @@ fn write_kerberos_config_snippet(
     // The tenant_id will be used in a file path. Validate it is really an UUID.
     uuid::Uuid::try_parse(tenant_id).map_err(|x| format!("Failed to validate tenant ID: {x}"))?;
 
-    let krb_conf_dir = PathBuf::from(DEFAULT_KERBEROS_CONF_DIR);
-
     trace!(?krb_conf_dir, "Check kerberos config dir exists");
     match krb_conf_dir.try_exists() {
         Ok(true) if krb_conf_dir.is_dir() => Ok(()),
         Ok(true) => Err(format!("Path {krb_conf_dir:?} is not a directory")),
-        Ok(false) => Err(format!("Path {krb_conf_dir:?} does not exist")),
+        Ok(false) => fs::create_dir_all(krb_conf_dir)
+            .map_err(|e| format!("Failed to create {krb_conf_dir:?}: {e}")),
         Err(e) => Err(format!("Failed to check if {krb_conf_dir:?} exists: {e}")),
     }?;
 
@@ -492,7 +665,7 @@ fn write_kerberos_config_snippet(
         .map_err(|e| format!("Failed to write to {krb_snippet:?}: {e}"))?;
 
     let realms = format!(
-        "[realms]\n\tKERBEROS.MICROSOFTONLINE.COM = {{\n\t\tkdc = https://login.microsoftonline.com/{tenant_id}/kerberos\n\t}}\n"
+        "[realms]\n\tKERBEROS.MICROSOFTONLINE.COM = {{\n\t\tkdc = https://{authority_host}/{tenant_id}/kerberos\n\t}}\n"
     );
     file.write_all(realms.as_bytes())
         .map_err(|e| format!("Failed to write to {krb_snippet:?}: {e}"))?;
@@ -581,16 +754,16 @@ async fn handle_tasks(stream: UnixStream, cfg: &HimmelblauConfig) {
                     return;
                 }
             }
-            Some(Ok(TaskRequest::KerberosConfig(top_level_names, tenant_id))) => {
+            Some(Ok(TaskRequest::KerberosConfig(top_level_names, tenant_id, authority_host))) => {
                 debug!("Received task -> KerberosConfig(...)");
 
-                let response = match tenant_id {
-                    Some(t) => match write_kerberos_config_snippet(top_level_names, &t) {
+                let response = match (tenant_id, authority_host) {
+                    (Some(t), Some(host)) => match write_kerberos_config_snippet(top_level_names, &t, &host) {
                         Ok(_) => TaskResponse::Success(0),
                         Err(msg) => TaskResponse::Error(msg),
                     },
-                    None => TaskResponse::Error(
-                        "Failed to write Kerberos config snippet, no tenant_id".to_string(),
+                    _ => TaskResponse::Error(
+                        "Failed to write Kerberos config snippet, missing tenant_id or authority_host".to_string(),
                     ),
                 };
 
@@ -623,92 +796,17 @@ async fn handle_tasks(stream: UnixStream, cfg: &HimmelblauConfig) {
                     return;
                 }
             }
-            Some(Ok(TaskRequest::LoadProfilePhoto(mut account_id, access_token))) => {
+            Some(Ok(TaskRequest::LoadProfilePhoto(account_id, access_token))) => {
                 debug!("Received task -> LoadProfilePhoto(...)");
-                let icons_dir = "/var/lib/AccountsService/icons/";
-                let users_dir = "/var/lib/AccountsService/users/";
-                if !Path::new(icons_dir).exists() {
-                    info!("Profile photo directory '{}' doesn't exist.", icons_dir);
-                } else {
-                    let upn = account_id.clone();
-                    let domain = split_username(&upn).map(|(_, domain)| domain);
-                    account_id = cfg.map_upn_to_name(&account_id);
-
-                    // Validate account_id to prevent path traversal and
-                    // cross-user aliasing. Reject rather than strip to avoid
-                    // collisions (e.g. "a/lice" and "alice" mapping to the same file).
-                    if account_id.is_empty()
-                        || !account_id.chars().all(|c| {
-                            c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-')
-                        })
-                    {
-                        error!(
-                            "Invalid account_id for profile photo - disallowed characters, rejecting"
-                        );
-                    // Set the profile picture
-                    } else if let Some(domain) = domain {
-                        let filename = format!("{}{}", icons_dir, account_id);
-                        match OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .custom_flags(libc::O_NOFOLLOW)
-                            .open(&filename)
-                        {
-                            Ok(file) => {
-                                let authority_host = cfg.get_authority_host(domain);
-                                let tenant_id = cfg.get_tenant_id(domain);
-                                let graph_url = cfg.get_graph_url(domain);
-                                let ip_versions = cfg.get_ip_versions();
-                                let request_timeout = cfg.get_request_timeout();
-                                if let Ok(graph) = Graph::new(
-                                    &cfg.get_odc_provider(domain),
-                                    domain,
-                                    Some(&authority_host),
-                                    tenant_id.as_deref(),
-                                    graph_url.as_deref(),
-                                    Duration::from_secs(request_timeout),
-                                    &ip_versions,
-                                )
-                                .await
-                                {
-                                    if let Err(e) =
-                                        graph.fetch_user_profile_photo(&access_token, file).await
-                                    {
-                                        error!("Failed fetching user profile photo: {:?}", e);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed creating file for user profile photo: {:?}", e)
-                            }
-                        }
-                        let user_file = format!("{}{}", users_dir, account_id);
-                        match OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .custom_flags(libc::O_NOFOLLOW)
-                            .open(&user_file)
-                        {
-                            Ok(mut file) => {
-                                let contents =
-                                    format!("[User]\nIcon={}\nSystemAccount=false\n", filename);
-
-                                if let Err(e) = file.write_all(contents.as_bytes()) {
-                                    error!("Failed writing to user profile settings: {:?}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed creating file for user profile settings: {:?}", e)
-                            }
-                        }
-                    } else {
-                        error!("Couldn't parse domain from name");
+                // Reply before Graph runs. This socket also serves HomeDirectory,
+                // and that request gives up after one second.
+                let cfg = cfg.clone();
+                tokio::spawn(async move {
+                    match load_profile_photo(&cfg, &account_id, &access_token).await {
+                        Ok(()) => info!("Fetching user profile picture succeeded"),
+                        Err(e) => error!("{e}"),
                     }
-                }
-
-                // Always indicate success here
+                });
                 if let Err(e) = reqs.send(TaskResponse::Success(0)).await {
                     error!("Error -> {:?}", e);
                     return;
@@ -778,14 +876,17 @@ async fn handle_tasks(stream: UnixStream, cfg: &HimmelblauConfig) {
             }
             Some(Ok(TaskRequest::SubordinateIds(username, start, count))) => {
                 debug!(
-                    "Received task -> SubordinateIds({}, {}, {})",
+                    "Received task -> SubordinateIds({:?}, {}, {})",
                     username, start, count
                 );
 
                 let resp = match setup_subordinate_ids(&username, start, count) {
                     Ok(()) => TaskResponse::Success(0),
                     Err(msg) => {
-                        error!("Failed to setup subordinate IDs for {}: {}", username, msg);
+                        error!(
+                            "Failed to setup subordinate IDs for {:?}: {}",
+                            username, msg
+                        );
                         TaskResponse::Error(msg)
                     }
                 };
@@ -865,6 +966,14 @@ async fn main() -> ExitCode {
             let mut d_broadcast_rx = broadcast_tx.subscribe();
 
             let server = tokio::spawn(async move {
+                tokio::select! {
+                    _ = broadcast_rx.recv() => return,
+                    result = restore_configuration_policies(&cfg) => {
+                        if let Err(e) = result {
+                            error!("Failed to restore configuration policy units: {e:#}");
+                        }
+                    }
+                }
                 loop {
                     info!("Attempting to connect to himmelblaud ...");
 
@@ -987,4 +1096,198 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// The exact payload from GHSA-x259-23ph-65m5.
+    const ADVISORY_PAYLOAD: &str = "padding:100000:65536\nattacker:0:65536\npadding";
+    const TENANT_ID: &str = "11111111-2222-3333-4444-555555555555";
+
+    #[test]
+    fn validate_subid_username_accepts_legitimate_names() {
+        for username in [
+            "user",
+            "user@example.com",
+            "first.last-1_2@contoso.com",
+            "user+alias@example.com",
+            "jos\u{e9}@example.com",
+        ] {
+            assert!(
+                validate_subid_username(username).is_ok(),
+                "expected {:?} to be accepted",
+                username
+            );
+        }
+    }
+
+    #[test]
+    fn group_membership_matches_newline_terminated_last_member() {
+        let users = "alice,bob\n";
+
+        assert!(group_members_include(users, "bob"));
+    }
+
+    #[test]
+    fn validate_subid_username_rejects_record_forging_names() {
+        for username in [
+            "",
+            "attacker:0:65536",
+            ADVISORY_PAYLOAD,
+            "victim\nroot",
+            "victim\r\nroot",
+            "victim\0root",
+        ] {
+            assert!(
+                validate_subid_username(username).is_err(),
+                "expected {:?} to be rejected",
+                username
+            );
+        }
+    }
+
+    #[test]
+    fn add_subid_entry_rejects_payload_and_leaves_file_untouched() {
+        let subid_file = tempfile::NamedTempFile::new().expect("failed to create temp subid file");
+        let path = subid_file.path();
+
+        let before = fs::read(path).unwrap_or_default();
+
+        assert!(add_subid_entry(ADVISORY_PAYLOAD, 100000, 65536, path).is_err());
+
+        let after = fs::read(path).unwrap_or_default();
+        assert_eq!(before, after, "subid file must not be modified");
+    }
+
+    #[test]
+    fn add_subid_entry_appends_a_single_record_for_a_valid_name() {
+        let subid_file = tempfile::NamedTempFile::new().expect("failed to create temp subid file");
+        let path = subid_file.path();
+
+        assert!(add_subid_entry("user@example.com", 2100000000, 65536, path).is_ok());
+
+        let contents = fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(contents, "user@example.com:2100000000:65536\n");
+
+        // A second call for the same user must not duplicate the record.
+        assert!(add_subid_entry("user@example.com", 2100000000, 65536, path).is_ok());
+
+        let contents = fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(contents, "user@example.com:2100000000:65536\n");
+    }
+
+    #[test]
+    fn profile_photo_temp_file_is_private() {
+        let icons_dir = tempfile::tempdir().expect("failed to create temp icon directory");
+        let profile_photo = create_profile_photo_temp_file(icons_dir.path())
+            .expect("failed to create profile photo");
+
+        let mode = profile_photo
+            .as_file()
+            .metadata()
+            .expect("failed to read profile photo metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn profile_photo_account_resolution_reloads_user_map() {
+        let tempdir = tempfile::tempdir().expect("failed to create temp directory");
+        let user_map_path = tempdir.path().join("user-map");
+        let config_path = tempdir.path().join("himmelblau.conf");
+        fs::write(&user_map_path, "alice:user@example.com\n").expect("failed to write user map");
+        fs::write(
+            &config_path,
+            format!("[global]\nuser_map_file = {}\n", user_map_path.display()),
+        )
+        .expect("failed to write config");
+        let cfg = HimmelblauConfig::new(Some(
+            config_path.to_str().expect("config path is not UTF-8"),
+        ))
+        .expect("failed to parse config");
+
+        assert_eq!(
+            resolve_profile_photo_account_id(&cfg, "User@Example.com"),
+            "alice"
+        );
+
+        fs::write(&user_map_path, "bob:user@example.com\n").expect("failed to update user map");
+        assert_eq!(
+            resolve_profile_photo_account_id(&cfg, "user@example.com"),
+            "bob"
+        );
+    }
+
+    #[test]
+    fn profile_photo_failure_returns_task_error() {
+        match profile_photo_task_response(Err("profile photo failed".to_string())) {
+            TaskResponse::Error(message) => assert_eq!(message, "profile photo failed"),
+            response => panic!("expected task error, got {response:?}"),
+        }
+    }
+
+    #[test]
+    fn write_kerberos_config_snippet_creates_missing_config_dir() {
+        let tmpdir = tempfile::tempdir().expect("failed to create temp dir");
+        let krb_conf_dir = tmpdir.path().join("krb5.conf.d");
+
+        write_kerberos_config_snippet_to(
+            Some(".example.com, example.com, invalid:realm".to_string()),
+            TENANT_ID,
+            "login.microsoftonline.us",
+            &krb_conf_dir,
+        )
+        .expect("expected kerberos config snippet to be written");
+
+        assert!(krb_conf_dir.is_dir());
+        let snippet_path = krb_conf_dir.join(format!("himmelblau_{TENANT_ID}.conf"));
+        let contents =
+            fs::read_to_string(snippet_path).expect("expected kerberos config snippet to exist");
+        assert!(contents.contains("[libdefaults]\n\tdns_canonicalize_hostname = false\n"));
+        assert!(contents.contains(&format!(
+            "\t\tkdc = https://login.microsoftonline.us/{TENANT_ID}/kerberos"
+        )));
+        assert!(contents.contains("\t.example.com = KERBEROS.MICROSOFTONLINE.COM"));
+        assert!(contents.contains("\texample.com = KERBEROS.MICROSOFTONLINE.COM"));
+        assert!(!contents.contains("invalid:realm = KERBEROS.MICROSOFTONLINE.COM"));
+    }
+
+    #[test]
+    fn write_kerberos_config_snippet_rejects_non_directory_path() {
+        let krb_conf_dir =
+            tempfile::NamedTempFile::new().expect("failed to create temp config path");
+
+        let err = write_kerberos_config_snippet_to(
+            None,
+            TENANT_ID,
+            "login.microsoftonline.com",
+            krb_conf_dir.path(),
+        )
+        .expect_err("expected non-directory config path to be rejected");
+
+        assert!(err.contains("is not a directory"));
+    }
+
+    #[test]
+    fn write_kerberos_config_snippet_rejects_invalid_tenant_without_creating_dir() {
+        let tmpdir = tempfile::tempdir().expect("failed to create temp dir");
+        let krb_conf_dir = tmpdir.path().join("krb5.conf.d");
+
+        let err = write_kerberos_config_snippet_to(
+            None,
+            "not-a-tenant-id",
+            "login.microsoftonline.com",
+            &krb_conf_dir,
+        )
+        .expect_err("expected invalid tenant ID to be rejected");
+
+        assert!(err.contains("Failed to validate tenant ID"));
+        assert!(!krb_conf_dir.exists());
+    }
 }

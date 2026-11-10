@@ -21,10 +21,14 @@ use crate::constants::ID_MAP_CACHE;
 use crate::db::KeyStoreTxn;
 use crate::i18n::{tr, tr_fmt};
 use crate::idmap_cache::StaticIdCache;
-use crate::idprovider::common::build_online_probe_client;
 use crate::idprovider::common::flip_displayname_comma;
+use crate::idprovider::common::should_block_hello_pin_attempts;
 use crate::idprovider::common::KeyType;
 use crate::idprovider::common::TotpEnrollmentRecord;
+use crate::idprovider::common::{
+    build_online_probe_client, oidc_group_claims_from_value, oidc_user_token_from_claims,
+    OidcUserInfoClaims,
+};
 use crate::idprovider::common::{BadPinCounter, RefreshCache, RefreshCacheEntry};
 use crate::idprovider::interface::{
     tpm, AuthCacheAction, AuthCredHandler, AuthRequest, AuthResult, CacheState, GroupToken, Id,
@@ -35,16 +39,20 @@ use crate::{
     check_hello_totp_enabled, check_hello_totp_setup, extract_base_url, handle_hello_bad_pin_count,
     impl_change_auth_token, impl_check_online, impl_create_decoupled_hello_key,
     impl_handle_hello_pin_totp_auth, impl_himmelblau_hello_key_helpers,
-    impl_himmelblau_offline_auth_init, impl_himmelblau_offline_auth_step, impl_offline_break_glass,
-    impl_setup_hello_totp, impl_unix_user_access, load_cached_prt_no_op, no_op_prt_token_fetch,
-    oidc_refresh_token_token_fetch,
+    impl_himmelblau_offline_auth_init, impl_himmelblau_offline_auth_step,
+    impl_himmelblau_try_unseal, impl_offline_break_glass, impl_probe_online, impl_setup_hello_totp,
+    impl_unix_user_access, load_cached_prt_for_try_unseal_no_op, load_cached_prt_no_op,
+    no_op_prt_token_fetch, oidc_refresh_token_token_fetch,
 };
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use bytes::{BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
-use himmelblau::{error::MsalError, MFAAuthContinue, UserToken as UnixUserToken};
+use himmelblau::{
+    error::{ErrorResponse, MsalError},
+    MFAAuthContinue, UserToken as UnixUserToken,
+};
 use himmelblau::{ClientInfo, IdToken};
 use idmap::Idmap;
 use kanidm_hsm_crypto::structures::LoadableMsHelloKey;
@@ -59,7 +67,7 @@ use openidconnect::core::{
     CoreAuthDisplay, CoreClaimName, CoreClaimType, CoreClient, CoreClientAuthMethod,
     CoreGenderClaim, CoreGrantType, CoreJsonWebKey, CoreJweContentEncryptionAlgorithm,
     CoreJweKeyManagementAlgorithm, CoreJwsSigningAlgorithm, CoreResponseMode, CoreResponseType,
-    CoreSubjectIdentifierType, CoreUserInfoClaims,
+    CoreSubjectIdentifierType,
 };
 use openidconnect::{
     AdditionalProviderMetadata, AuthType, ClientId, DeviceAuthorizationResponse,
@@ -69,6 +77,7 @@ use openidconnect::{
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::net::UnixStream;
@@ -321,6 +330,8 @@ fn pam_auth_request_kind(pam_next_req: &PamAuthRequest) -> &'static str {
         PamAuthRequest::HelloTOTP { .. } => "hello_totp",
         PamAuthRequest::Fido { .. } => "fido",
         PamAuthRequest::FidoUnavailable => "fido_unavailable",
+        PamAuthRequest::WebAuthn { .. } => "webauthn",
+        PamAuthRequest::WebAuthnUnavailable => "webauthn_unavailable",
     }
 }
 
@@ -334,6 +345,7 @@ fn auth_request_kind(auth_req: &AuthRequest) -> &'static str {
         AuthRequest::SetupPin { .. } => "setup_pin",
         AuthRequest::Pin => "pin",
         AuthRequest::Fido { .. } => "fido",
+        AuthRequest::WebAuthn { .. } => "webauthn",
         AuthRequest::ChangePassword { .. } => "change_password",
         AuthRequest::InitDenied { .. } => "init_denied",
     }
@@ -733,6 +745,7 @@ fn auth_request_from_orchestrator_inputs(
             "Selected input prompt from orchestrator inputs"
         );
         return AuthRequest::Input {
+            enrollment: None,
             msg,
             echo_on: matches!(input.input_type, OrchestratorInputType::Text),
         };
@@ -747,6 +760,7 @@ fn auth_request_from_orchestrator_inputs(
             "Selected MFAPoll prompt from orchestrator confirmation input"
         );
         return AuthRequest::MFAPoll {
+            enrollment: None,
             msg: input
                 .prompt
                 .clone()
@@ -758,6 +772,7 @@ fn auth_request_from_orchestrator_inputs(
 
     debug!("No explicit orchestrator input matched; defaulting to MFAPoll waiting prompt");
     AuthRequest::MFAPoll {
+        enrollment: None,
         msg: tr("Waiting for browser authentication to complete..."),
         polling_interval: poll_interval_secs,
         show_push_hint: false,
@@ -869,16 +884,236 @@ fn orchestrator_inputs_from_pam_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        auth_request_from_orchestrator_inputs, mfa_from_oidc_device,
-        oidc_should_prompt_hello_setup, orchestrator_inputs_from_pam_request,
-        parse_oidc_mfa_extra_data, ropc_is_invalid_credentials, serialize_oidc_mfa_extra_data,
-        validated_password_cache_action, OidcMfaExtraData, OrchestratorFlowState,
-        OrchestratorInputType, OrchestratorRequiredInput,
+        auth_request_from_orchestrator_inputs, mfa_from_oidc_device, oidc_cache_refresh_token,
+        oidc_hello_refresh_token_candidates, oidc_refresh_failure_state,
+        oidc_refresh_token_rejected, oidc_should_prompt_hello_setup,
+        orchestrator_inputs_from_pam_request, parse_oidc_mfa_extra_data,
+        resolve_device_authorization_endpoint, ropc_is_invalid_credentials,
+        serialize_oidc_mfa_extra_data, validated_password_cache_action, DeviceAuthorizationUrl,
+        DeviceEndpointProviderMetadata, OidcMfaExtraData, OidcTokenResponse, OidcUserInfoClaims,
+        OrchestratorFlowState, OrchestratorInputType, OrchestratorRequiredInput,
     };
-    use crate::idprovider::interface::{AuthCacheAction, AuthRequest, AuthResult};
+    use crate::idprovider::common::oidc_account_id_from_userinfo;
+    use crate::idprovider::common::{RefreshCache, RefreshCacheEntry};
+    use crate::idprovider::interface::{AuthCacheAction, AuthRequest, AuthResult, UserTokenState};
     use crate::unix_proto::PamAuthRequest;
+    use himmelblau::error::{ErrorResponse, MsalError};
     use oauth2::DeviceAuthorizationResponse;
     use serde_json::json;
+
+    #[test]
+    fn oidc_device_endpoint_metadata_is_optional() {
+        let metadata: DeviceEndpointProviderMetadata = serde_json::from_value(json!({})).unwrap();
+        assert!(metadata.device_authorization_endpoint.is_none());
+    }
+
+    #[test]
+    fn oidc_device_endpoint_prefers_discovery_then_configuration_and_requires_https() {
+        let discovered =
+            DeviceAuthorizationUrl::new("https://idp.example/discovered".into()).unwrap();
+        let configured = "https://idp.example/configured".to_string();
+
+        let endpoint = resolve_device_authorization_endpoint(
+            Some(discovered.clone()),
+            Some(configured.clone()),
+        )
+        .unwrap();
+        assert_eq!(endpoint, discovered);
+
+        let endpoint = resolve_device_authorization_endpoint(None, Some(configured)).unwrap();
+        assert_eq!(endpoint.as_str(), "https://idp.example/configured");
+
+        let insecure_discovered =
+            DeviceAuthorizationUrl::new("http://idp.example/discovered".into()).unwrap();
+        assert!(resolve_device_authorization_endpoint(
+            Some(insecure_discovered),
+            Some("https://idp.example/configured".to_string())
+        )
+        .is_none());
+        assert!(resolve_device_authorization_endpoint(
+            None,
+            Some("http://idp.example/configured".to_string())
+        )
+        .is_none());
+        assert!(
+            resolve_device_authorization_endpoint(None, Some("not a valid URL".to_string()))
+                .is_none()
+        );
+        assert!(resolve_device_authorization_endpoint(None, None).is_none());
+    }
+
+    #[test]
+    fn oidc_group_claims_extract_keycloak_groups_and_roles() {
+        let claims = json!({
+            "groups": ["/linux-users", "/admins"],
+            "realm_access": {
+                "roles": ["offline_access", "uma_authorization"]
+            },
+            "resource_access": {
+                "himmelblau": {
+                    "roles": ["login"]
+                },
+                "account": {
+                    "roles": ["manage-account"]
+                }
+            }
+        });
+
+        assert_eq!(
+            super::oidc_group_claims_from_value(&claims),
+            vec![
+                "/admins",
+                "/linux-users",
+                "login",
+                "manage-account",
+                "offline_access",
+                "uma_authorization",
+            ]
+        );
+    }
+
+    #[test]
+    fn oidc_group_claims_accept_single_string_group() {
+        let claims = json!({
+            "groups": " /linux-users "
+        });
+
+        assert_eq!(
+            super::oidc_group_claims_from_value(&claims),
+            vec!["/linux-users"]
+        );
+    }
+
+    #[test]
+    fn oidc_group_claims_reject_unsafe_group_names() {
+        let claims = json!({
+            "groups": [
+                "valid",
+                "bad:group",
+                "bad\ngroup",
+                "   "
+            ]
+        });
+
+        assert_eq!(super::oidc_group_claims_from_value(&claims), vec!["valid"]);
+    }
+
+    #[test]
+    fn oidc_refresh_invalidates_only_for_invalid_grant() {
+        assert!(matches!(
+            oidc_refresh_failure_state(&MsalError::RequestFailed("offline".to_string())),
+            UserTokenState::UseCached
+        ));
+        assert!(matches!(
+            oidc_refresh_failure_state(&MsalError::AcquireTokenFailed(ErrorResponse {
+                error: "invalid_grant".to_string(),
+                error_description: "refresh token expired".to_string(),
+                suberror: None,
+                error_codes: vec![],
+            })),
+            UserTokenState::NotFound
+        ));
+        for error in [
+            "invalid_client",
+            "invalid_scope",
+            "temporarily_unavailable",
+            "server_error",
+        ] {
+            assert!(matches!(
+                oidc_refresh_failure_state(&MsalError::AcquireTokenFailed(ErrorResponse {
+                    error: error.to_string(),
+                    error_description: "provider rejected the request".to_string(),
+                    suberror: None,
+                    error_codes: vec![],
+                })),
+                UserTokenState::UseCached
+            ));
+        }
+        for error in [
+            "Failed to read refresh token response body",
+            "Failed to parse refresh token error response",
+        ] {
+            assert!(matches!(
+                oidc_refresh_failure_state(&MsalError::GeneralFailure(error.to_string())),
+                UserTokenState::UseCached
+            ));
+        }
+    }
+
+    #[test]
+    fn oidc_refresh_token_rejected_only_for_invalid_grant() {
+        let rejected = |error: &str| {
+            oidc_refresh_token_rejected(&MsalError::AcquireTokenFailed(ErrorResponse {
+                error: error.to_string(),
+                error_description: "provider rejected the request".to_string(),
+                suberror: None,
+                error_codes: vec![],
+            }))
+        };
+        assert!(rejected("invalid_grant"));
+        assert!(!rejected("invalid_client"));
+        assert!(!rejected("server_error"));
+        assert!(!oidc_refresh_token_rejected(&MsalError::RequestFailed(
+            "offline".to_string()
+        )));
+    }
+
+    #[test]
+    fn oidc_hello_refresh_token_candidates_prefer_in_memory_token() {
+        // A background refresh rotated the token in memory after the PIN
+        // login sealed the previous one (#1874).
+        assert_eq!(
+            oidc_hello_refresh_token_candidates(
+                Some("rotated".to_string()),
+                Some("sealed".to_string())
+            ),
+            vec!["rotated".to_string(), "sealed".to_string()]
+        );
+        assert_eq!(
+            oidc_hello_refresh_token_candidates(Some("same".to_string()), Some("same".to_string())),
+            vec!["same".to_string()]
+        );
+        // After a daemon restart only the sealed token is left.
+        assert_eq!(
+            oidc_hello_refresh_token_candidates(None, Some("sealed".to_string())),
+            vec!["sealed".to_string()]
+        );
+        assert_eq!(
+            oidc_hello_refresh_token_candidates(Some("in-memory".to_string()), None),
+            vec!["in-memory".to_string()]
+        );
+        assert!(oidc_hello_refresh_token_candidates(None, None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn oidc_exchanged_refresh_token_replaces_in_memory_token() {
+        // A PIN login sealed the rotated token, then a later step failed. The
+        // next PIN login must not present the revoked token first (#1874).
+        let cache = RefreshCache::new();
+        cache
+            .add(
+                "user@example.com",
+                &RefreshCacheEntry::RefreshToken("consumed".to_string()),
+            )
+            .await;
+        let token: OidcTokenResponse = serde_json::from_value(json!({
+            "access_token": "access",
+            "token_type": "bearer",
+            "refresh_token": "rotated",
+        }))
+        .unwrap();
+
+        oidc_cache_refresh_token(&cache, "user@example.com", &token).await;
+
+        let in_memory = match cache.refresh_token("user@example.com").await {
+            Ok(RefreshCacheEntry::RefreshToken(refresh_token)) => Some(refresh_token),
+            _ => None,
+        };
+        assert_eq!(
+            oidc_hello_refresh_token_candidates(in_memory, Some("rotated".to_string())),
+            vec!["rotated".to_string()]
+        );
+    }
 
     #[test]
     fn ropc_invalid_credentials_detects_bad_password() {
@@ -919,6 +1154,117 @@ mod tests {
         assert!(!oidc_should_prompt_hello_setup(true, true, true, true));
         assert!(!oidc_should_prompt_hello_setup(true, false, false, true));
         assert!(!oidc_should_prompt_hello_setup(true, false, true, false));
+    }
+
+    #[test]
+    fn oidc_account_id_uses_first_matching_configured_claim() {
+        let userinfo = OidcUserInfoClaims::from_json::<reqwest::Error>(
+            br#"{
+                "sub": "24400320",
+                "preferred_username": "preferred@example.com",
+                "email": "email@example.com",
+                "uid": "linuxuser"
+            }"#,
+            None,
+        )
+        .unwrap();
+
+        let claims = vec![
+            "missing".to_string(),
+            "uid".to_string(),
+            "email".to_string(),
+        ];
+
+        assert_eq!(
+            oidc_account_id_from_userinfo(&userinfo, &claims, false).unwrap(),
+            "linuxuser"
+        );
+    }
+
+    #[test]
+    fn oidc_account_id_falls_back_when_configured_claims_miss() {
+        let userinfo = OidcUserInfoClaims::from_json::<reqwest::Error>(
+            br#"{
+                "sub": "24400320",
+                "preferred_username": "preferred@example.com",
+                "email": "email@example.com"
+            }"#,
+            None,
+        )
+        .unwrap();
+
+        let claims = vec!["uid".to_string(), "username".to_string()];
+
+        assert_eq!(
+            oidc_account_id_from_userinfo(&userinfo, &claims, false).unwrap(),
+            "preferred@example.com"
+        );
+    }
+
+    #[test]
+    fn oidc_account_id_fallback_skips_empty_claims() {
+        let userinfo = OidcUserInfoClaims::from_json::<reqwest::Error>(
+            br#"{
+                "sub": "24400320",
+                "preferred_username": "",
+                "email": "email@example.com"
+            }"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            oidc_account_id_from_userinfo(&userinfo, &[], false).unwrap(),
+            "email@example.com"
+        );
+    }
+
+    #[test]
+    fn oidc_account_id_fallback_rejects_empty_claims() {
+        let userinfo = OidcUserInfoClaims::from_json::<reqwest::Error>(
+            br#"{
+                "sub": "24400320",
+                "preferred_username": "",
+                "email": ""
+            }"#,
+            None,
+        )
+        .unwrap();
+
+        assert!(oidc_account_id_from_userinfo(&userinfo, &[], false).is_err());
+    }
+
+    #[test]
+    fn oidc_account_id_strips_at_suffix_when_configured() {
+        let userinfo = OidcUserInfoClaims::from_json::<reqwest::Error>(
+            br#"{
+                "sub": "24400320",
+                "preferred_username": "preferred@example.com",
+                "email": "email@example.com"
+            }"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            oidc_account_id_from_userinfo(&userinfo, &[], true).unwrap(),
+            "preferred"
+        );
+    }
+
+    #[test]
+    fn oidc_account_id_rejects_empty_after_stripping_at_suffix() {
+        let userinfo = OidcUserInfoClaims::from_json::<reqwest::Error>(
+            br#"{
+                "sub": "24400320",
+                "preferred_username": "@example.com",
+                "email": "email@example.com"
+            }"#,
+            None,
+        )
+        .unwrap();
+
+        assert!(oidc_account_id_from_userinfo(&userinfo, &[], true).is_err());
     }
 
     #[test]
@@ -1079,7 +1425,11 @@ mod tests {
 
         let request = auth_request_from_orchestrator_inputs(&required_inputs, 2);
         match request {
-            AuthRequest::Input { msg, echo_on } => {
+            AuthRequest::Input {
+                enrollment: _,
+                msg,
+                echo_on,
+            } => {
                 assert_eq!(msg, "Email");
                 assert!(echo_on);
             }
@@ -1099,7 +1449,11 @@ mod tests {
 
         let request = auth_request_from_orchestrator_inputs(&required_inputs, 2);
         match request {
-            AuthRequest::Input { msg, echo_on } => {
+            AuthRequest::Input {
+                enrollment: _,
+                msg,
+                echo_on,
+            } => {
                 assert_eq!(msg, "OTP");
                 assert!(!echo_on);
             }
@@ -1120,6 +1474,7 @@ mod tests {
         let request = auth_request_from_orchestrator_inputs(&required_inputs, 5);
         match request {
             AuthRequest::MFAPoll {
+                enrollment: _,
                 msg,
                 polling_interval,
                 show_push_hint,
@@ -1244,10 +1599,34 @@ const OFFLINE_NEXT_CHECK: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct DeviceEndpointProviderMetadata {
-    device_authorization_endpoint: DeviceAuthorizationUrl,
+    #[serde(default)]
+    device_authorization_endpoint: Option<DeviceAuthorizationUrl>,
 }
 
 impl AdditionalProviderMetadata for DeviceEndpointProviderMetadata {}
+
+fn resolve_device_authorization_endpoint(
+    discovered: Option<DeviceAuthorizationUrl>,
+    configured: Option<String>,
+) -> Option<DeviceAuthorizationUrl> {
+    let endpoint = discovered.or_else(|| {
+        configured.and_then(|endpoint| match DeviceAuthorizationUrl::new(endpoint) {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                error!(
+                    ?error,
+                    "Invalid configured OIDC device authorization endpoint"
+                );
+                None
+            }
+        })
+    })?;
+    if endpoint.url().scheme() != "https" {
+        error!("OIDC device authorization endpoint must use HTTPS");
+        return None;
+    }
+    Some(endpoint)
+}
 
 type DeviceProviderMetadata = ProviderMetadata<
     DeviceEndpointProviderMetadata,
@@ -1461,6 +1840,98 @@ fn validated_password_cache_action(
     }
 }
 
+async fn oidc_userinfo_from_claims(
+    delayed_init: &OidcDelayedInit,
+    access_token: &openidconnect::AccessToken,
+) -> Result<(OidcUserInfoClaims, Vec<String>), IdpError> {
+    let Some(userinfo_url) = delayed_init.client.user_info_url() else {
+        error!("OIDC client missing userinfo endpoint URL");
+        return Err(IdpError::BadRequest);
+    };
+
+    let bytes = delayed_init
+        .http_client
+        .get(userinfo_url.as_str())
+        .bearer_auth(access_token.secret())
+        .send()
+        .await
+        .map_err(|e| {
+            error!(?e, "Error calling userinfo endpoint");
+            IdpError::BadRequest
+        })?
+        .error_for_status()
+        .map_err(|e| {
+            error!(?e, "Error calling userinfo endpoint");
+            IdpError::BadRequest
+        })?
+        .bytes()
+        .await
+        .map_err(|e| {
+            error!(?e, "Error reading userinfo response");
+            IdpError::BadRequest
+        })?;
+
+    let userinfo = OidcUserInfoClaims::from_json::<reqwest::Error>(&bytes, None).map_err(|e| {
+        error!(?e, "Error parsing userinfo claims");
+        IdpError::BadRequest
+    })?;
+
+    let group_claims = serde_json::from_slice::<Value>(&bytes)
+        .map(|claims| oidc_group_claims_from_value(&claims))
+        .map_err(|e| {
+            error!(?e, "Error parsing userinfo group claims");
+            IdpError::BadRequest
+        })?;
+
+    Ok((userinfo, group_claims))
+}
+
+fn oidc_refresh_token_rejected(error: &MsalError) -> bool {
+    matches!(error, MsalError::AcquireTokenFailed(response) if response.error == "invalid_grant")
+}
+
+fn oidc_refresh_failure_state(error: &MsalError) -> UserTokenState {
+    if oidc_refresh_token_rejected(error) {
+        UserTokenState::NotFound
+    } else {
+        UserTokenState::UseCached
+    }
+}
+
+/// Order the refresh tokens to try for an online Hello PIN authentication:
+/// the in-memory token first, because a background refresh rotates it without
+/// re-sealing, then the sealed token if it differs.
+fn oidc_hello_refresh_token_candidates(
+    in_memory: Option<String>,
+    sealed: Option<String>,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = in_memory.into_iter().collect();
+    if let Some(sealed) = sealed {
+        if !candidates.contains(&sealed) {
+            candidates.push(sealed);
+        }
+    }
+    candidates
+}
+
+/// Cache the refresh token returned by a refresh-token exchange in memory.
+/// A rotating IdP has already revoked the token that was presented, so this
+/// runs before any later step can fail and leave the revoked token cached.
+async fn oidc_cache_refresh_token(
+    refresh_cache: &RefreshCache,
+    account_id: &str,
+    token: &OidcTokenResponse,
+) {
+    if let Some(refresh_token) = token.refresh_token() {
+        refresh_cache
+            .add(
+                account_id,
+                &RefreshCacheEntry::RefreshToken(refresh_token.secret().to_string()),
+            )
+            .await;
+    }
+}
+
 pub struct OidcApplication {
     client: Mutex<Option<OidcDelayedInit>>,
 }
@@ -1552,8 +2023,17 @@ impl OidcApplication {
                 .device_authorization_endpoint
                 .clone();
 
+            let configured_device_endpoint =
+                config.lock().await.get_oidc_device_authorization_endpoint();
+
             // Create a public client: pass None for the client secret.
             // Whether this works depends on provider configuration. Many support it.
+            let device_endpoint =
+                resolve_device_authorization_endpoint(device_endpoint, configured_device_endpoint)
+                    .ok_or_else(|| {
+                        debug!("OIDC device authorization endpoint is not available");
+                        IdpError::BadRequest
+                    })?;
             let client = CoreClient::from_provider_metadata(provider_metadata, client_id, None)
                 .set_device_authorization_url(device_endpoint)
                 .set_auth_type(AuthType::RequestBody);
@@ -1838,9 +2318,7 @@ impl OidcApplication {
                 .form(&body)
                 .send()
                 .await
-                .map_err(|e| {
-                    MsalError::GeneralFailure(format!("Failed to send refresh token request: {e}"))
-                })?;
+                .map_err(|e| MsalError::RequestFailed(e.to_string()))?;
 
             let status = resp.status();
             let bytes = resp.bytes().await.map_err(|e| {
@@ -1856,68 +2334,25 @@ impl OidcApplication {
                     ))
                 })
             } else {
-                #[derive(Deserialize, Debug)]
-                struct RefreshTokenErrorResponse {
-                    error: String,
-                    #[allow(dead_code)]
-                    error_description: Option<String>,
-                }
+                let err: ErrorResponse = serde_json::from_slice(&bytes).map_err(|e| {
+                    error!(
+                        ?e,
+                        status = ?status,
+                        body = %String::from_utf8_lossy(&bytes),
+                        "Unexpected refresh token response"
+                    );
+                    MsalError::GeneralFailure(format!(
+                        "Failed to parse refresh token error response: {e}"
+                    ))
+                })?;
 
-                let err: RefreshTokenErrorResponse =
-                    serde_json::from_slice(&bytes).map_err(|e| {
-                        error!(
-                            ?e,
-                            status = ?status,
-                            body = %String::from_utf8_lossy(&bytes),
-                            "Unexpected refresh token response"
-                        );
-                        MsalError::GeneralFailure(format!(
-                            "Failed to parse refresh token error response: {e}"
-                        ))
-                    })?;
-
-                match err.error.as_str() {
-                    // Most common refresh failures
-                    "invalid_grant" => {
-                        error!(
-                            desc = ?err.error_description,
-                            "Refresh token rejected (invalid_grant)"
-                        );
-                        Err(MsalError::GeneralFailure(
-                            "Refresh token rejected (invalid_grant)".to_string(),
-                        ))
-                    }
-                    "invalid_client" => {
-                        error!(
-                            desc = ?err.error_description,
-                            "Client authentication failed (invalid_client)"
-                        );
-                        Err(MsalError::GeneralFailure(
-                            "Client authentication failed (invalid_client)".to_string(),
-                        ))
-                    }
-                    "invalid_scope" => {
-                        error!(
-                            desc = ?err.error_description,
-                            "Requested scope is invalid for refresh (invalid_scope)"
-                        );
-                        Err(MsalError::GeneralFailure(
-                            "Requested scope is invalid for refresh (invalid_scope)".to_string(),
-                        ))
-                    }
-                    other => {
-                        error!(
-                            error = %other,
-                            desc = ?err.error_description,
-                            status = ?status,
-                            "Refresh token grant failed with unexpected error"
-                        );
-                        Err(MsalError::GeneralFailure(format!(
-                            "Refresh token grant failed with error: {}",
-                            other
-                        )))
-                    }
-                }
+                error!(
+                    error = %err.error,
+                    desc = %err.error_description,
+                    status = ?status,
+                    "Refresh token grant failed"
+                );
+                Err(MsalError::AcquireTokenFailed(err))
             }
         } else {
             Err(MsalError::RequestFailed(
@@ -1933,83 +2368,31 @@ impl OidcApplication {
         shell: String,
         idmap: &Mutex<Idmap>,
         tenant_id: &Uuid,
+        account_id_claims: &[String],
+        strip_at_suffix: bool,
     ) -> Result<UserToken, IdpError> {
         let access_token = token.access_token();
-        let userinfo: CoreUserInfoClaims = if let Some(delayed_init) = &*self.client.lock().await {
-            delayed_init
-                .client
-                .user_info(access_token.clone(), None)
-                .map_err(|e| {
-                    error!(?e, "Error building userinfo request");
-                    IdpError::BadRequest
-                })?
-                .request_async(&delayed_init.http_client)
-                .await
-                .map_err(|e| {
-                    error!(?e, "Error calling userinfo endpoint");
-                    IdpError::BadRequest
-                })?
-        } else {
-            error!("OIDC client not initialized");
-            return Err(IdpError::BadRequest);
-        };
+        let (userinfo, mut group_claims): (OidcUserInfoClaims, Vec<String>) =
+            if let Some(delayed_init) = &*self.client.lock().await {
+                oidc_userinfo_from_claims(delayed_init, access_token).await?
+            } else {
+                error!("OIDC client not initialized");
+                return Err(IdpError::BadRequest);
+            };
+        group_claims.sort();
+        group_claims.dedup();
 
-        let account_id = userinfo
-            .preferred_username()
-            .map(|username| username.to_string())
-            .or_else(|| userinfo.email().map(|email| email.to_string()))
-            .ok_or_else(|| {
-                error!("Missing preferred_username and email claims in userinfo");
-                IdpError::BadRequest
-            })?;
-
-        let subject = userinfo.subject().to_string();
-        let object_id = uuid::Uuid::new_v5(tenant_id, subject.as_bytes());
-
-        let idmap_cache = StaticIdCache::new(ID_MAP_CACHE, false).map_err(|e| {
-            error!("Failed reading from the idmap cache: {:?}", e);
-            IdpError::BadRequest
-        })?;
-
-        let (uid, gid) = match idmap_cache.get_user_by_name(&account_id) {
-            Some(user) => (user.uid, user.gid),
-            None => {
-                let idmap = idmap.lock().await;
-                let gid = idmap
-                    .gen_to_unix(&tenant_id.to_string(), &account_id)
-                    .map_err(|e| {
-                        error!("{:?}", e);
-                        IdpError::BadRequest
-                    })?;
-                (gid, gid)
-            }
-        };
-
-        let displayname = userinfo
-            .name()
-            .and_then(|n| n.get(None))
-            .map(|n| n.to_string())
-            .unwrap_or_default();
-
-        let displayname = flip_displayname_comma(&displayname);
-
-        Ok(UserToken {
-            name: account_id.to_string(),
-            spn: account_id.to_string(),
-            uuid: object_id,
-            real_gidnumber: Some(uid),
-            gidnumber: gid,
-            displayname,
-            shell: Some(shell),
-            groups: vec![GroupToken {
-                name: account_id.to_string(),
-                spn: account_id.to_string(),
-                uuid: object_id,
-                gidnumber: gid,
-            }],
-            tenant_id: Some(*tenant_id),
-            valid: true,
-        })
+        let mut claims = serde_json::to_value(&userinfo).map_err(|_| IdpError::BadRequest)?;
+        claims["groups"] = serde_json::json!(group_claims);
+        oidc_user_token_from_claims(
+            &claims,
+            shell,
+            idmap,
+            tenant_id,
+            account_id_claims,
+            strip_at_suffix,
+        )
+        .await
     }
 }
 
@@ -2022,10 +2405,10 @@ impl Default for OidcApplication {
 pub struct OidcProvider {
     config: Arc<Mutex<HimmelblauConfig>>,
     idmap: Arc<Mutex<Idmap>>,
-    state: Mutex<CacheState>,
+    pub(crate) state: Arc<Mutex<CacheState>>,
     client: OidcApplication,
-    refresh_cache: RefreshCache,
-    bad_pin_counter: BadPinCounter,
+    pub(crate) refresh_cache: Arc<RefreshCache>,
+    pub(crate) bad_pin_counter: Arc<BadPinCounter>,
     domain: String,
 }
 
@@ -2039,10 +2422,10 @@ impl OidcProvider {
         Ok(Self {
             config: cfg.clone(),
             idmap: idmap.clone(),
-            state: Mutex::new(CacheState::OfflineNextCheck(SystemTime::now())),
+            state: Arc::new(Mutex::new(CacheState::OfflineNextCheck(SystemTime::now()))),
             client: OidcApplication::new(),
-            refresh_cache: RefreshCache::new(),
-            bad_pin_counter: BadPinCounter::new(),
+            refresh_cache: Arc::new(RefreshCache::new()),
+            bad_pin_counter: Arc::new(BadPinCounter::new()),
             domain: domain.to_string(),
         })
     }
@@ -2061,8 +2444,8 @@ impl OidcProvider {
         Ok(Uuid::new_v5(&HIMMELBLAU_OIDC_NAMESPACE, issuer.as_bytes()))
     }
 
-    #[instrument(level = "debug", skip(self, _tpm))]
-    async fn attempt_online(&self, _tpm: &mut tpm::provider::BoxedDynTpm, now: SystemTime) -> bool {
+    #[instrument(level = "debug", skip(self))]
+    async fn attempt_online(&self, now: SystemTime) -> bool {
         if (self.delayed_init().await).is_err() {
             // Initialization failed. Report that the system is offline. We
             // can't proceed with initialization until the system is online.
@@ -2086,7 +2469,10 @@ impl OidcProvider {
             };
 
         let request_timeout = self.config.lock().await.get_request_timeout();
-        let client = match build_online_probe_client(request_timeout) {
+        let client = match build_online_probe_client(
+            request_timeout,
+            reqwest::redirect::Policy::default(),
+        ) {
             Ok(c) => c,
             Err(e) => {
                 error!(?e, "Failed to build HTTP client for online check");
@@ -2179,7 +2565,7 @@ impl OidcProvider {
         let (enabled, socket_path, provider, timeout_secs, poll_interval_secs) = {
             let cfg = self.config.lock().await;
             (
-                cfg.get_orchestrator_enabled(),
+                cfg.get_experimental_orchestrator_enabled(),
                 cfg.get_orchestrator_socket(),
                 cfg.get_orchestrator_provider(),
                 cfg.get_orchestrator_timeout_secs(),
@@ -2307,6 +2693,7 @@ impl OidcProvider {
         let polling_interval = flow.polling_interval.unwrap_or(5000);
         Ok((
             AuthRequest::MFAPoll {
+                enrollment: None,
                 msg: flow.msg.clone(),
                 polling_interval: polling_interval / 1000,
                 show_push_hint: false,
@@ -2379,10 +2766,24 @@ impl OidcProvider {
         token: &OidcTokenResponse,
     ) -> Result<AuthResult, IdpError> {
         let tenant_id = self.tenant_id().await?;
-        let shell = self.config.lock().await.get_shell(None);
+        let (shell, account_id_claims, strip_at_suffix) = {
+            let config = self.config.lock().await;
+            (
+                config.get_shell(None),
+                config.get_oidc_account_id_claims(),
+                config.get_oidc_account_id_strip_at_suffix(),
+            )
+        };
         let token2 = self
             .client
-            .user_token_from_oidc(token, shell, self.idmap.as_ref(), &tenant_id)
+            .user_token_from_oidc(
+                token,
+                shell,
+                self.idmap.as_ref(),
+                &tenant_id,
+                &account_id_claims,
+                strip_at_suffix,
+            )
             .await?;
         if account_id.to_string().to_lowercase() != token2.name.to_string().to_lowercase() {
             let msg = tr_fmt(
@@ -2410,9 +2811,14 @@ impl OidcProvider {
 
 #[async_trait]
 impl IdProvider for OidcProvider {
-    #[instrument(level = "debug", skip(self, tpm))]
-    async fn check_online(&self, tpm: &mut tpm::provider::BoxedDynTpm, now: SystemTime) -> bool {
-        impl_check_online!(self, tpm, now)
+    #[instrument(level = "debug", skip(self, _tpm))]
+    async fn check_online(&self, _tpm: &mut tpm::provider::BoxedDynTpm, now: SystemTime) -> bool {
+        impl_check_online!(self, now)
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn probe_online(&self, _account_id: Option<&str>, now: SystemTime) -> bool {
+        impl_probe_online!(self, now)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2442,6 +2848,99 @@ impl IdProvider for OidcProvider {
                 }
             },
         };
+
+        // Existing OIDC users must only be refreshed from authenticated
+        // provider data. The synthetic token below is suitable for resolving a
+        // user before their first authentication, but replacing a cached token
+        // with it would discard the group claims used by pam_allow_groups.
+        if token.is_some() {
+            let refresh_token = match self.refresh_cache.refresh_token(account_id).await {
+                Ok(RefreshCacheEntry::RefreshToken(refresh_token)) => refresh_token,
+                Ok(RefreshCacheEntry::Prt(_)) => {
+                    error!(
+                        "Unexpected PRT cache entry while refreshing generic OIDC user '{}'",
+                        account_id
+                    );
+                    return Ok(UserTokenState::UseCached);
+                }
+                Err(e) => {
+                    debug!(
+                        ?e,
+                        "No authenticated refresh token available for cached OIDC user '{}'",
+                        account_id
+                    );
+                    return Ok(UserTokenState::UseCached);
+                }
+            };
+
+            let refreshed = match self
+                .client
+                .acquire_token_by_refresh_token(&refresh_token, vec![])
+                .await
+            {
+                Ok(refreshed) => refreshed,
+                Err(e) => {
+                    let state = oidc_refresh_failure_state(&e);
+                    if matches!(&state, UserTokenState::UseCached) {
+                        match &e {
+                            MsalError::RequestFailed(msg) => {
+                                let url = extract_base_url!(msg);
+                                info!(
+                                    ?url,
+                                    "Network down while refreshing authenticated OIDC user '{}'; retaining cached claims",
+                                    account_id
+                                );
+                            }
+                            _ => {
+                                error!(
+                                    ?e,
+                                    "OIDC refresh failed for authenticated user '{}'; retaining cached claims",
+                                    account_id
+                                );
+                            }
+                        }
+                        let mut cache_state = self.state.lock().await;
+                        *cache_state =
+                            CacheState::OfflineNextCheck(SystemTime::now() + OFFLINE_NEXT_CHECK);
+                    } else {
+                        error!(
+                            ?e,
+                            "OIDC refresh token was rejected for '{}'; invalidating cached user",
+                            account_id
+                        );
+                    }
+                    return Ok(state);
+                }
+            };
+
+            return match self.token_validate(account_id, &refreshed).await {
+                Ok(AuthResult::Success { token }) => Ok(UserTokenState::Update(token)),
+                Ok(AuthResult::Denied(msg)) => {
+                    error!(
+                        %msg,
+                        "Refreshed OIDC identity did not match cached user '{}'; invalidating cached user",
+                        account_id
+                    );
+                    Ok(UserTokenState::NotFound)
+                }
+                Ok(AuthResult::Next(_)) => {
+                    error!(
+                        "Unexpected continuation while refreshing cached OIDC user '{}'; retaining cached claims",
+                        account_id
+                    );
+                    Ok(UserTokenState::UseCached)
+                }
+                Err(e) => {
+                    error!(
+                        ?e,
+                        "Failed to rebuild cached OIDC user '{}' from authenticated claims",
+                        account_id
+                    );
+                    Ok(UserTokenState::UseCached)
+                }
+            };
+        }
+
         let displayname = match token {
             Some(tok) => tok.displayname.clone(),
             None => "".to_string(),
@@ -2477,7 +2976,7 @@ impl IdProvider for OidcProvider {
             }
         };
 
-        Ok(UserTokenState::Update(UserToken {
+        Ok(UserTokenState::LookupOnly(UserToken {
             name: account_id.to_string(),
             spn: account_id.to_string(),
             uuid: object_id,
@@ -2505,7 +3004,7 @@ impl IdProvider for OidcProvider {
         no_hello_pin: bool,
         force_reauth: bool,
         keystore: &mut D,
-        tpm: &mut tpm::provider::BoxedDynTpm,
+        _tpm: &mut tpm::provider::BoxedDynTpm,
         _machine_key: &tpm::structures::StorageKey,
         _shutdown_rx: &broadcast::Receiver<()>,
     ) -> Result<(AuthRequest, AuthCredHandler), IdpError> {
@@ -2540,6 +3039,7 @@ impl IdProvider for OidcProvider {
                 .iter()
                 .any(|s| !s.is_empty() && service.contains(s));
         let hello_totp_enabled = check_hello_totp_enabled!(self);
+        let console_password_only = self.config.lock().await.get_allow_console_password_only();
         let allow_remote_hello = self.config.lock().await.get_allow_remote_hello();
         // Skip Hello authentication if it is disabled by config
         let hello_enabled = self.config.lock().await.get_enable_hello();
@@ -2547,7 +3047,10 @@ impl IdProvider for OidcProvider {
         if hello_key.is_none()
             || !hello_enabled
             || (is_remote_service && !hello_totp_enabled && !allow_remote_hello)
-            || self.bad_pin_counter.bad_pin_count(account_id).await > hello_pin_retry_count
+            || should_block_hello_pin_attempts(
+                self.bad_pin_counter.bad_pin_count(account_id).await,
+                hello_pin_retry_count,
+            )
             || no_hello_pin
             || force_reauth
         {
@@ -2555,7 +3058,6 @@ impl IdProvider for OidcProvider {
             // is enabled by config, this is not a remote service, and the provider
             // advertises the `password` grant. Behaves like the Entra password-only
             // flow: a successful password can still lead to Hello PIN setup.
-            let console_password_only = self.config.lock().await.get_allow_console_password_only();
             if console_password_only
                 && !is_remote_service
                 && self.client.password_grant_supported().await
@@ -2576,7 +3078,7 @@ impl IdProvider for OidcProvider {
         } else {
             // Check if the network is even up prior to sending a PIN prompt,
             // otherwise we duplicate the PIN prompt when the network goes down.
-            if !self.attempt_online(tpm, SystemTime::now()).await {
+            if !self.attempt_online(SystemTime::now()).await {
                 // We are offline, fail the authentication now
                 return Err(IdpError::BadRequest);
             }
@@ -2590,7 +3092,7 @@ impl IdProvider for OidcProvider {
         &self,
         account_id: &str,
         old_token: &UserToken,
-        _service: &str,
+        service: &str,
         no_hello_pin: bool,
         cred_handler: &mut AuthCredHandler,
         pam_next_req: PamAuthRequest,
@@ -2611,14 +3113,37 @@ impl IdProvider for OidcProvider {
             ));
         }
 
+        let remote_services = self
+            .config
+            .lock()
+            .await
+            .get_password_only_remote_services_deny_list();
+        let is_remote_service = service.starts_with("remote:")
+            || remote_services
+                .iter()
+                .any(|s| !s.is_empty() && service.contains(s));
+        let hello_totp_enabled = check_hello_totp_enabled!(self);
+        let console_password_only = self.config.lock().await.get_allow_console_password_only();
+        let require_hello_totp =
+            hello_totp_enabled && (is_remote_service || !console_password_only);
+
         macro_rules! auth_and_validate_hello_key {
-            ($hello_key:ident, $keytype:ident, $cred:ident) => {{
+            ($hello_key:ident, $keytype:ident, $cred:ident, $require_hello_totp:expr) => {{
                 // CRITICAL: Validate that we can load the key, otherwise the offline
                 // fallback will allow the user to authenticate with a bad PIN here.
-                let pin = PinValue::new(&$cred).map_err(|e| {
-                    error!("Failed setting pin value: {:?}", e);
-                    IdpError::Tpm
-                })?;
+                let pin = match PinValue::new(&$cred) {
+                    Ok(pin) => pin,
+                    Err(e) => {
+                        error!("Failed setting pin value: {:?}", e);
+                        handle_hello_bad_pin_count!(self, account_id, keystore, |msg: &str| {
+                            Ok((AuthResult::Denied(msg.to_string()), AuthCacheAction::None))
+                        });
+                        return Ok((
+                            AuthResult::Denied(tr("Failed to authenticate with Hello PIN.")),
+                            AuthCacheAction::None,
+                        ));
+                    }
+                };
                 if let Err(e) = tpm.ms_hello_key_load(machine_key, &$hello_key, &pin) {
                     error!("{:?}", e);
                     handle_hello_bad_pin_count!(self, account_id, keystore, |msg: &str| {
@@ -2635,7 +3160,24 @@ impl IdProvider for OidcProvider {
                 let token = if $keytype == KeyType::Decoupled {
                     // Check for and decrypt any cached tokens
                     let hello_refresh_token_tag = self.fetch_hello_refresh_token_key_tag(account_id);
-                    let refresh_token = if let Ok(Some(sealed_refresh_token)) = refresh_cache_entry {
+                    // A background refresh in unix_user_get rotates the refresh
+                    // token in memory only, so the in-memory token is the newest
+                    // one and the sealed token is only a fallback (e.g. after a
+                    // daemon restart).
+                    let mut refresh_cache_corrupted = false;
+                    let in_memory_refresh_token = match self.refresh_cache.refresh_token(account_id).await {
+                        Ok(RefreshCacheEntry::RefreshToken(refresh_token)) => Some(refresh_token),
+                        Ok(_) => {
+                            error!("Invalid refresh cache entry type");
+                            refresh_cache_corrupted = true;
+                            None
+                        }
+                        Err(e) => {
+                            debug!(?e, "No refresh token in mem cache");
+                            None
+                        }
+                    };
+                    let sealed_refresh_token = if let Ok(Some(sealed_refresh_token)) = refresh_cache_entry {
                         let pin = PinValue::new(&$cred).map_err(|e| {
                             error!("Failed initializing pin value: {:?}", e);
                             IdpError::Tpm
@@ -2654,52 +3196,52 @@ impl IdProvider for OidcProvider {
                                     error!("Failed converting refresh token to string: {:?}", e);
                                     IdpError::Tpm
                                 })?;
-                                refresh_token
-                            }
-                            Err(e) => match self.refresh_cache.refresh_token(account_id).await {
-                                Ok(RefreshCacheEntry::RefreshToken(refresh_token)) => refresh_token,
-                                Ok(_) => {
-                                    error!("Invalid refresh cache entry type");
-                                    return Ok((
-                                        AuthResult::Denied(tr("Session data corrupted. Please sign in again.")),
-                                        AuthCacheAction::None,
-                                    ));
-                                }
-                                Err(e2) => {
-                                    error!(?e, "Failed unsealing hello refresh token from TPM");
-                                    error!(?e2, "Failed retrieving refresh token from mem cache");
-                                    return Ok((
-                                        AuthResult::Denied(tr("Your session has expired. Please sign in again.")),
-                                        AuthCacheAction::None,
-                                    ));
-                                }
-                            },
-                        }
-                    } else {
-                        match self.refresh_cache.refresh_token(account_id).await {
-                            Ok(RefreshCacheEntry::RefreshToken(refresh_token)) => refresh_token,
-                            Ok(_) => {
-                                error!("Invalid refresh cache entry type");
-                                return Ok((
-                                    AuthResult::Denied(tr("Session data corrupted. Please sign in again.")),
-                                    AuthCacheAction::None,
-                                ));
+                                Some(refresh_token)
                             }
                             Err(e) => {
-                                error!(?e, "Failed retrieving refresh token from mem cache");
-                                return Ok((
-                                    AuthResult::Denied(tr("Your session has expired. Please sign in again.")),
-                                    AuthCacheAction::None,
-                                ));
+                                error!(?e, "Failed unsealing hello refresh token from TPM");
+                                None
                             }
                         }
+                    } else {
+                        None
+                    };
+                    let mut refresh_tokens = oidc_hello_refresh_token_candidates(
+                        in_memory_refresh_token,
+                        sealed_refresh_token,
+                    )
+                    .into_iter();
+                    let Some(refresh_token) = refresh_tokens.next() else {
+                        error!("No refresh token available for Hello PIN authentication");
+                        let msg = if refresh_cache_corrupted {
+                            tr("Session data corrupted. Please sign in again.")
+                        } else {
+                            tr("Your session has expired. Please sign in again.")
+                        };
+                        return Ok((AuthResult::Denied(msg), AuthCacheAction::None));
                     };
                     // We have a refresh token, exchange that for an access token
-                    match self.client.acquire_token_by_refresh_token(
+                    let mut exchange = self.client.acquire_token_by_refresh_token(
                         &refresh_token,
                         vec![],
-                    ).await {
+                    ).await;
+                    // An IdP that rotates refresh tokens revokes the older one, so
+                    // try the other cached token once before giving up on the session.
+                    if let Err(e) = &exchange {
+                        if oidc_refresh_token_rejected(e) {
+                            if let Some(refresh_token) = refresh_tokens.next() {
+                                warn!(?e, "Refresh token was rejected; retrying with the other cached refresh token");
+                                exchange = self.client.acquire_token_by_refresh_token(
+                                    &refresh_token,
+                                    vec![],
+                                ).await;
+                            }
+                        }
+                    }
+                    match exchange {
                         Ok(token) => {
+                            // The next PIN login presents the in-memory token first.
+                            oidc_cache_refresh_token(&self.refresh_cache, account_id, &token).await;
                             self.bad_pin_counter.reset_bad_pin_count(account_id).await;
                             token
                         },
@@ -2711,7 +3253,7 @@ impl IdProvider for OidcProvider {
                             let mut state = self.state.lock().await;
                             *state =
                                 CacheState::OfflineNextCheck(SystemTime::now() + OFFLINE_NEXT_CHECK);
-                            if check_hello_totp_enabled!(self) {
+                            if $require_hello_totp {
                                 if !check_hello_totp_setup!(self, account_id, keystore) {
                                     return impl_setup_hello_totp!(
                                         self,
@@ -2800,13 +3342,25 @@ impl IdProvider for OidcProvider {
                     }
                 };
                 let tenant_id = self.tenant_id().await?;
-                let shell = self.config.lock().await.get_shell(None);
-                let token2 = self.client.user_token_from_oidc(
-                    &token,
-                    shell,
-                    self.idmap.as_ref(),
-                    &tenant_id,
-                ).await?;
+                let (shell, account_id_claims, strip_at_suffix) = {
+                    let config = self.config.lock().await;
+                    (
+                        config.get_shell(None),
+                        config.get_oidc_account_id_claims(),
+                        config.get_oidc_account_id_strip_at_suffix(),
+                    )
+                };
+                let token2 = self
+                    .client
+                    .user_token_from_oidc(
+                        &token,
+                        shell,
+                        self.idmap.as_ref(),
+                        &tenant_id,
+                        &account_id_claims,
+                        strip_at_suffix,
+                    )
+                    .await?;
                 tpm.seal_data(&win_hello_storage_key, refresh_token_zeroizing)
                     .map_err(|e| {
                         let uuid = token2.uuid.to_string();
@@ -2824,7 +3378,7 @@ impl IdProvider for OidcProvider {
 
                 match self.token_validate(account_id, &token).await {
                     Ok(AuthResult::Success { token }) => {
-                        if check_hello_totp_enabled!(self) {
+                        if $require_hello_totp {
                             if !check_hello_totp_setup!(self, account_id, keystore) {
                                 return impl_setup_hello_totp!(
                                     self,
@@ -2893,7 +3447,7 @@ impl IdProvider for OidcProvider {
                         IdpError::Tpm
                     })?;
 
-                auth_and_validate_hello_key!(hello_key, keytype, cred)
+                auth_and_validate_hello_key!(hello_key, keytype, cred, require_hello_totp)
             }
             (AuthCredHandler::PasswordFirst { .. }, PamAuthRequest::Password { cred }) => {
                 // Wrap the wire-delivered credential so this copy (and the clone
@@ -2943,12 +3497,12 @@ impl IdProvider for OidcProvider {
             }
             (_, PamAuthRequest::Pin { cred }) => {
                 let (hello_key, keytype) =
-                    self.fetch_hello_key(account_id, keystore).map_err(|e| {
-                        error!("Online authentication failed. Hello key missing.");
-                        e
-                    })?;
+                    self.fetch_hello_key(account_id, keystore)
+                        .inspect_err(|_| {
+                            error!("Online authentication failed. Hello key missing.");
+                        })?;
 
-                auth_and_validate_hello_key!(hello_key, keytype, cred)
+                auth_and_validate_hello_key!(hello_key, keytype, cred, require_hello_totp)
             }
             (
                 AuthCredHandler::MFA {
@@ -3459,11 +4013,7 @@ impl IdProvider for OidcProvider {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn get_cachestate<D: KeyStoreTxn + Send>(
-        &self,
-        _account_id: Option<&str>,
-        _keystore: &mut D,
-    ) -> CacheState {
+    async fn get_cachestate(&self, _account_id: Option<&str>) -> CacheState {
         self.state.lock().await.clone()
     }
 
@@ -3558,10 +4108,11 @@ impl IdProvider for OidcProvider {
         &self,
         account_id: &str,
         _token: Option<&UserToken>,
+        service: &str,
         no_hello_pin: bool,
         keystore: &mut D,
     ) -> Result<(AuthRequest, AuthCredHandler), IdpError> {
-        impl_himmelblau_offline_auth_init!(self, account_id, no_hello_pin, keystore, false)
+        impl_himmelblau_offline_auth_init!(self, account_id, service, no_hello_pin, keystore, false)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -3586,6 +4137,28 @@ impl IdProvider for OidcProvider {
             machine_key,
             token,
             load_cached_prt_no_op
+        )
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn unix_user_try_unseal<D: KeyStoreTxn + Send>(
+        &self,
+        account_id: &str,
+        cred: &str,
+        keystore: &mut D,
+        tpm: &mut tpm::provider::BoxedDynTpm,
+        machine_key: &tpm::structures::StorageKey,
+        online: bool,
+    ) -> Result<bool, IdpError> {
+        impl_himmelblau_try_unseal!(
+            self,
+            account_id,
+            cred,
+            keystore,
+            tpm,
+            machine_key,
+            online,
+            load_cached_prt_for_try_unseal_no_op
         )
     }
 

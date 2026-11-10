@@ -16,11 +16,27 @@ let
       pkgs.libunistring
     ];
   };
-  cargo_nix = pkgs.callPackage ./Cargo.nix {
+  cargoArgs = {
+    rootFeatures = [
+      "default"
+      "himmelblau_unix_common/tpm"
+    ];
     buildRustCrateForPkgs =
       pkgs:
       pkgs.buildRustCrate.override {
         defaultCrateOverrides = pkgs.defaultCrateOverrides // {
+          tss-esapi = attrs: {
+            DEP_TSS2_ESYS_VERSION = pkgs.tpm2-tss.version;
+          };
+          tss-esapi-sys = attrs: {
+            nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [
+              pkgs.pkg-config
+              pkgs.rustPlatform.bindgenHook
+            ];
+            buildInputs = (attrs.buildInputs or [ ]) ++ [
+              pkgs.tpm2-tss
+            ];
+          };
           idmap =
             attrs:
             unistring
@@ -54,6 +70,10 @@ let
                 pkgs.makeWrapper
               ];
               postInstall = (if attrs ? postInstall then attrs.postInstall else "") + ''
+                install -Dm755 \
+                  ${./src/daemon/scripts/himmelblau-init-hsm-pin} \
+                  $out/libexec/himmelblau-init-hsm-pin
+
                 po_dir=${./po}
                 linguas="$po_dir/LINGUAS"
                 if [ -f "$linguas" ]; then
@@ -112,6 +132,20 @@ let
                   $out/lib/mozilla/native-messaging-hosts/linux_entra_sso.json \
                   $out/lib/chromium/native-messaging-hosts/linux_entra_sso.json \
                    --replace-fail "/usr/bin/" "$out/bin/"
+            '';
+          };
+
+          himmelblau-collabora = attrs: {
+            postInstall = (attrs.postInstall or "") + ''
+              install -Dm644 platform/himmelblau-collabora.service \
+                $out/lib/systemd/user/himmelblau-collabora.service
+              install -Dm644 platform/himmelblau-collabora.desktop \
+                $out/etc/xdg/autostart/himmelblau-collabora.desktop
+
+              substituteInPlace $out/lib/systemd/user/himmelblau-collabora.service \
+                --replace-fail "/usr/bin/himmelblau-collabora" "$out/bin/himmelblau-collabora"
+              substituteInPlace $out/etc/xdg/autostart/himmelblau-collabora.desktop \
+                --replace-fail "Exec=systemctl " "Exec=${pkgs.systemd}/bin/systemctl "
             '';
           };
 
@@ -186,6 +220,41 @@ let
         };
       };
   };
+  cargo_nix = pkgs.callPackage ./Cargo.nix cargoArgs;
+  packageIds = {
+    daemon = "himmelblaud";
+    aad-tool = "aad-tool";
+    sso = "sso";
+    broker = "broker";
+    o365 = "o365";
+    collabora = "himmelblau-collabora";
+    pam = "pam_himmelblau";
+    nss = "nss_himmelblau";
+  };
+
+  # Resolve features once across the exported packages, not once per binary.
+  # Without this we would rebuild many packages ~4 times, with slightly different
+  # features enabled. Note that this synthetic root is only used to align features
+  # and is never actually built. We pick out of this joint derivation the packages
+  # we want to export below.
+  joinlyDerivedCrates = cargo_nix.internal.builtRustCratesWithFeatures {
+    packageId = "himmelblau-temp-root";
+    features = [ ];
+    runTests = false;
+    buildRustCrateForPkgsFunc = cargoArgs.buildRustCrateForPkgs;
+    crateConfigs = cargo_nix.internal.crates // {
+      himmelblau-temp-root = {
+        crateName = "himmelblau-temp-root";
+        dependencies = map (
+          packageId: {
+            name = packageId;
+            inherit packageId;
+            features = cargoArgs.rootFeatures;
+          }
+        ) (builtins.attrValues packageIds);
+      };
+    };
+  };
 in
 rec {
 
@@ -193,6 +262,7 @@ rec {
     imports = [ ./nix/modules/himmelblau.nix ];
     services.himmelblau = {
       daemonPackage = pkgs.lib.mkDefault packages.daemon;
+      aadToolPackage = pkgs.lib.mkDefault packages.aad-tool;
       ssoPackage = pkgs.lib.mkDefault packages.sso;
       brokerPackage = pkgs.lib.mkDefault packages.broker;
       pamPackage = pkgs.lib.mkDefault packages.pam;
@@ -200,15 +270,7 @@ rec {
     };
   };
 
-  packages = {
-    daemon = cargo_nix.workspaceMembers."himmelblaud".build;
-    aad-tool = cargo_nix.workspaceMembers."aad-tool".build;
-    sso = cargo_nix.workspaceMembers."sso".build;
-    broker = cargo_nix.workspaceMembers."broker".build;
-    o365 = cargo_nix.workspaceMembers."o365".build;
-    pam = cargo_nix.workspaceMembers."pam_himmelblau".build;
-    nss = cargo_nix.workspaceMembers."nss_himmelblau".build;
-  };
+  packages = lib.mapAttrs (_: packageId: joinlyDerivedCrates.crates.${packageId}) packageIds;
 
   passthru = { inherit pkgs; };
 }
