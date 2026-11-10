@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   check-version:
+    if: ${{ !startsWith(github.head_ref, 'automation/stable-maintenance/recover-') }}
     runs-on: ubuntu-latest
 
     steps:
