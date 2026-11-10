@@ -9,6 +9,7 @@ This follows a config-driven pattern inspired by Samba's bootstrap/config.py:
 - deb family => cargo deb chain with per-package feature flags and --deb-revision=<distro>
 - rpm/zypper family => cargo build + strip + cargo generate-rpm chain
 - ebuild family => generates Gentoo ebuild file via gen_ebuild.py
+- arch family => makepkg via scripts/package_arch.py (platform/arch/PKGBUILD)
 """
 
 import argparse
@@ -70,7 +71,7 @@ SELINUX_PKGS = ["policycoreutils-devel", "selinux-policy-targeted"]
 AUTHSELECT_PKGS = ["authselect"]
 
 DEB_PKGS = COMMON + [p for p, _ in PKG_PAIRS if p]
-RPM_PKGS = COMMON + AUTHSELECT_PKGS + [q for _, q in PKG_PAIRS if q]
+RPM_PKGS = COMMON + AUTHSELECT_PKGS + ["rpm-build"] + [q for _, q in PKG_PAIRS if q]
 
 # enable caching of apt packages: https://docs.docker.com/build/cache/optimize/#use-cache-mounts
 APT_BOOTSTRAP = """\
@@ -85,26 +86,57 @@ RUN dnf -y update && dnf -y install \\\n    {pkgs} \\\n && dnf clean all\n"""
 ZYPPER_BOOTSTRAP = """\
 RUN zypper --non-interactive refresh && \\\n    zypper --non-interactive update && \\\n    zypper --non-interactive install --no-recommends \\\n        {pkgs} && \\\n    zypper clean --all\n"""
 
+PACMAN_BOOTSTRAP = """\
+RUN pacman -Syu --noconfirm && \\\n    pacman -S --noconfirm --needed \\\n        {pkgs} && \\\n    pacman -Scc --noconfirm\n"""
+
+ARCH_PKGS = [
+    "base-devel",
+    "clang",
+    "cmake",
+    "dbus",
+    "gettext",
+    "git",
+    "krb5",
+    "libcap",
+    "libunistring",
+    "openssl",
+    "pam",
+    "pcre2",
+    "python",
+    "rust",
+    "sqlite",
+    "systemd",
+    "tpm2-tss",
+]
+
 FAMILIES = {
     "deb": {
         "bootstrap": APT_BOOTSTRAP,
         "pkgs": DEB_PKGS,
+        "packaging_tool": "cargo-deb",
         "env": "ENV DEBIAN_FRONTEND=noninteractive HIMMELBLAU_ALLOW_MISSING_SELINUX=1",
     },
     "rpm": {
         "bootstrap": DNF_BOOTSTRAP,
         "pkgs": RPM_PKGS,
+        "packaging_tool": "cargo-generate-rpm",
         "env": None,
     },
     "zypper": {
         "bootstrap": ZYPPER_BOOTSTRAP,
         "pkgs": RPM_PKGS,
+        "packaging_tool": "cargo-generate-rpm",
         "env": None,
     },
     "ebuild": {
         # Minimal bootstrap for ebuild generation - just needs Python (in base image)
         "bootstrap": "# No additional packages needed - Python is in the base image",
         "pkgs": [],
+        "env": None,
+    },
+    "arch": {
+        "bootstrap": PACMAN_BOOTSTRAP,
+        "pkgs": ARCH_PKGS,
         "env": None,
     },
 }
@@ -127,8 +159,17 @@ PACKAGES = [
     ("selinux", "src/selinux", False),
     ("apparmor", "src/apparmor", False),
     ("o365", "src/o365", False),
-    ("himmelblau-orchestrator", "src/orchestrator", False),
+    ("himmelblau-collabora", "src/collabora", False),
 ]
+
+RPM_INTERNAL_REQUIRES = {
+    "src/nss": ("himmelblau",),
+    "src/pam": ("himmelblau",),
+    "src/broker": ("himmelblau",),
+    "src/sso": ("himmelblau-broker",),
+    "src/o365": ("himmelblau",),
+    "src/collabora": ("himmelblau-broker",),
+}
 
 CMD_TAB = "     "
 CMD_SEP = f" && \\ \n{CMD_TAB}"
@@ -137,14 +178,26 @@ CMD_SEP = f" && \\ \n{CMD_TAB}"
 GEN_MANPAGE = "python3 src/common/scripts/gen_param_code.py --gen-man --man-output man/man5/himmelblau.conf.5"
 
 
+def selected_packages(with_orchestrator: bool) -> list:
+    packages = list(PACKAGES)
+    if with_orchestrator:
+        packages.append(("himmelblau-orchestrator", "src/orchestrator", False))
+    return packages
+
+
+def build_manpage_cmd(with_orchestrator: bool) -> str:
+    return GEN_MANPAGE + (" --with-orchestrator" if with_orchestrator else "")
+
+
 def build_deb_final_cmd(
     features: list,
     distro_slug: str,
     cross_target: str = "",
+    with_orchestrator: bool = False,
 ) -> str:
     target_arg = f" --target={cross_target}" if cross_target else ""
     parts = []
-    for pkg, _, needs_tpm in PACKAGES:
+    for pkg, _, needs_tpm in selected_packages(with_orchestrator):
         if pkg == "selinux":  # Debian doesn't use selinux
             continue
         # Copy the feature list per-package so that stripping "tpm" for a
@@ -164,17 +217,21 @@ def build_deb_final_cmd(
             cmd += f" && python3 scripts/patch_apparmor_deb_relationships.py --distro={distro_slug} --package-dir={package_dir}"
         parts.append(cmd)
     gen_servicefiles = "make deb-servicefiles"
-    return f'CMD ["/bin/sh", "-c", \\\n{CMD_TAB}"{GEN_MANPAGE} && {gen_servicefiles} && {CMD_SEP.join(parts)} "]'
+    return f'CMD ["/bin/sh", "-c", \\\n{CMD_TAB}"{build_manpage_cmd(with_orchestrator)} && {gen_servicefiles} && {CMD_SEP.join(parts)} "]'
 
 
-def build_rpm_final_cmd(features: list, selinux: bool, apparmor: bool) -> str:
+def build_rpm_final_cmd(
+    features: list, selinux: bool, apparmor: bool, with_orchestrator: bool = False,
+) -> str:
     feat_str = f" --features {','.join(features)}" if features else ""
-    build = f"cargo build ${{CARGO_PATCH_ARG}} --release{feat_str} && \\ \n{CMD_TAB}"
-    strip = CMD_SEP.join(
-        ["strip -s target/release/%s" % s for s in ["*.so", "aad-tool", "himmelblaud", "himmelblaud_tasks", "broker", "himmelblaud-orchestrator"]]
-    )
+    workspace_args = "--workspace" if with_orchestrator else "--workspace --exclude himmelblau-orchestrator"
+    build = f"cargo build ${{CARGO_PATCH_ARG}} --release {workspace_args}{feat_str} && \\ \n{CMD_TAB}"
+    strip_targets = ["*.so", "aad-tool", "himmelblaud", "himmelblaud_tasks", "broker"]
+    if with_orchestrator:
+        strip_targets.append("himmelblaud-orchestrator")
+    strip = CMD_SEP.join(["strip -s target/release/%s" % s for s in strip_targets])
     pkgs = []
-    for pkg in PACKAGES:
+    for pkg in selected_packages(with_orchestrator):
         if pkg[0] == "selinux" and not selinux:
             continue
         if pkg[0] == "apparmor" and not apparmor:
@@ -182,19 +239,46 @@ def build_rpm_final_cmd(features: list, selinux: bool, apparmor: bool) -> str:
         pkgs.append(pkg)
     rpm_cmds = []
     for _, s, _ in pkgs:
-        rpm_cmds.append(f"cargo generate-rpm -p {s}")
+        requires = RPM_INTERNAL_REQUIRES.get(s, ())
+        requires_arg = ""
+        if requires:
+            requires_toml = ", ".join(
+                f"{package} = '= ${{RPM_INTERNAL_VERSION}}-${{RPM_INTERNAL_RELEASE}}'"
+                for package in requires
+            )
+            requires_arg = (
+                f' --set-metadata \\"requires = {{ {requires_toml} }}\\"'
+            )
+        rpm_cmds.append(
+            f'cargo generate-rpm -p {s} '
+            f'--set-metadata \\"release = \'${{RPM_INTERNAL_RELEASE}}\'\\"'
+            f'{requires_arg}'
+        )
+    rpm_cmds.insert(
+        0,
+        "RPM_INTERNAL_VERSION=$(cargo metadata --no-deps --format-version 1 "
+        "| jq -r '.packages[] | select(.name == \\\"himmelblaud\\\") | .version')",
+    )
+    rpm_cmds.insert(1, 'RPM_INTERNAL_RELEASE=\\"${RPM_PACKAGE_RELEASE:-1}\\"')
     rpms = CMD_SEP.join(rpm_cmds)
     if apparmor:
         gen_servicefiles = "make rpm-servicefiles ORCHESTRATOR_APPARMOR_PROFILE=himmelblau-orchestrator-container"
     else:
         gen_servicefiles = "make rpm-servicefiles"
     gen_authselect = "(authselect select minimal --force || authselect select local --force) && make authselect"
-    return f'CMD ["/bin/sh", "-c", \\\n{CMD_TAB}"{GEN_MANPAGE} && {gen_servicefiles} && {build}{strip} && {gen_authselect} && \\\n{CMD_TAB}{rpms}"]'
+    return f'CMD ["/bin/sh", "-c", \\\n{CMD_TAB}"{build_manpage_cmd(with_orchestrator)} && {gen_servicefiles} && {build}{strip} && {gen_authselect} && \\\n{CMD_TAB}{rpms}"]'
 
 
-def build_gentoo_final_cmd(features: list, repo_root: Path) -> str:
+def build_gentoo_final_cmd(
+    features: list, repo_root: Path, with_orchestrator: bool = False,
+) -> str:
     """Build command for Gentoo - generates an ebuild file."""
-    return f'CMD ["/bin/sh", "-c", "{GEN_MANPAGE} && python3 scripts/gen_ebuild.py --out ./packaging/"]'
+    return f'CMD ["/bin/sh", "-c", "{build_manpage_cmd(with_orchestrator)} && python3 scripts/gen_ebuild.py --out ./packaging/"]'
+
+
+def build_arch_final_cmd() -> str:
+    """Build command for Arch - runs makepkg on platform/arch/PKGBUILD."""
+    return 'CMD ["/bin/sh", "-c", "python3 scripts/package_arch.py --out ./packaging/"]'
 
 
 # ---- Distro targets ----------------------------------------------------------
@@ -256,11 +340,17 @@ DISTS = {
         "tpm": True,
         "selinux": True,
     },
+    "fedora45": {
+        "family": "rpm",
+        "image": "fedora:45",
+        "tpm": True,
+        "selinux": True,
+    },
     "rawhide": {
         "family": "rpm",
         "image": "fedora:rawhide",
         "extra_prep": [
-            "RUN dnf -y --refresh update glibc glibc-common glibc-minimal-langpack systemd-libs systemd-standalone-sysusers rpm-libs rpm && dnf -y --refresh update"
+            "RUN dnf -y --refresh --disablerepo=fedora-cisco-openh264 update glibc glibc-common glibc-minimal-langpack systemd-libs systemd-standalone-sysusers rpm-libs rpm && dnf -y --refresh --disablerepo=fedora-cisco-openh264 update"
         ],
         "tpm": True,
         "selinux": True,
@@ -312,32 +402,18 @@ DISTS = {
         "selinux": True,
     },
     # ---- SUSE family ----
-    "sle15sp6": {
-        "family": "zypper",
-        "image": "registry.suse.com/suse/sle15:15.6",
-        "scc": True,
-        "scc_vers": "15.6",
-        "post_bootstrap": [
-            # Python 3.6 doesn't have dataclasses; install python311 and symlink as python3
-            "RUN zypper --non-interactive install python311 && ln -sf /usr/bin/python3.11 /usr/bin/python3",
-        ],
-        "replace": {
-            "build-essential": "",
-            "@development-tools": "",
-            "dbus-devel": "dbus-1-devel",
-            "tpm2-tss-devel": "tpm2-0-tss-devel",
-            "sqlite-devel": "sqlite3-devel",
-            "policycoreutils-devel": "",
-            "selinux-policy-targeted": "",
-        },
-        "tpm": True,
-        "apparmor": True,
-    },
     "sle15sp7": {
         "family": "zypper",
-        "image": "registry.suse.com/suse/sle15:15.7",
-        "scc": True,
-        "scc_vers": "15.7",
+        # The Ruby development BCI is an SP7 image that already contains the
+        # matching sqlite3-devel package, which is not published by SLE_BCI.
+        # The remaining SLE development packages come from SLE_BCI, while the
+        # public Backports projects supply authselect and LLVM/Clang.
+        "image": "registry.suse.com/bci/ruby:2.5",
+        "extra_prep": [
+            "RUN zypper ar -e https://download.opensuse.org/repositories/openSUSE:/Backports:/SLE-15-SP7/standard/openSUSE:Backports:SLE-15-SP7.repo",
+            "RUN zypper ar -e https://download.opensuse.org/repositories/openSUSE:/Backports:/SLE-15-SP7:/Update/standard/openSUSE:Backports:SLE-15-SP7:Update.repo",
+            "RUN zypper --non-interactive --gpg-auto-import-keys refresh openSUSE_Backports_SLE-15-SP7 openSUSE_Backports_SLE-15-SP7_Update",
+        ],
         "post_bootstrap": [
             # Python 3.6 doesn't have dataclasses; install python311 and symlink as python3
             "RUN zypper --non-interactive install python311 && ln -sf /usr/bin/python3.11 /usr/bin/python3",
@@ -347,8 +423,10 @@ DISTS = {
             "@development-tools": "",
             "dbus-devel": "dbus-1-devel",
             "tpm2-tss-devel": "tpm2-0-tss-devel",
+            # The generic Backports package is a metapackage for clang17 from
+            # a non-public SLE module; clang14 is fully in Backports itself.
+            "clang": "clang14",
             "sqlite-devel": "sqlite3-devel",
-            "clang": "clang7",
             "policycoreutils-devel": "",
             "selinux-policy-targeted": "",
         },
@@ -357,10 +435,10 @@ DISTS = {
     },
     "sle16": {
         "family": "zypper",
-        "image": "registry.suse.com/bci/bci-sle16-kernel-module-devel:16.0",
-        "scc": True,
-        "scc_vers": "16.0",
+        "image": "registry.suse.com/bci/bci-base:16.0",
         "extra_prep": [
+            "RUN zypper ar -e https://download.opensuse.org/distribution/leap/16.0/repo/oss openSUSE_Leap_16.0_OSS",
+            "RUN zypper --non-interactive --gpg-auto-import-keys refresh openSUSE_Leap_16.0_OSS",
             # Temporary patch for broken SLE libudev1 version in the base image
             "RUN zypper in -y --oldpackage libudev1-257.7-160000.2.2.$(uname -m)",
             # Temporary authselect build, since it hasn't landed in PackageHub yet
@@ -406,6 +484,15 @@ DISTS = {
         "tpm": True,
         "selinux": False,
     },
+    # ---- Arch Linux family ----
+    # Containerized makepkg; produces himmelblau-*.pkg.tar.zst in ./packaging/
+    "arch": {
+        "family": "arch",
+        "image": "archlinux:base-devel",
+        "extra_prep": [],
+        "tpm": True,
+        "selinux": False,
+    },
     # ---- Amazon Linux family ----
     "amzn2023": {
         "family": "rpm",
@@ -425,7 +512,6 @@ DOCKERFILE_TPL = """\
 {GENERATED_MARKER}{tooling_stage}FROM {base_image}
 
 {env}
-{sle_connect}
 
 # Build argument for optional Cargo patch configuration
 ARG CARGO_PATCH_ARG=""
@@ -514,7 +600,7 @@ WORKDIR /himmelblau
 # Install Rust + aarch64 target + packaging tools (native amd64)
 RUN --mount=type=cache,target=/root/.cargo/registry curl https://sh.rustup.rs -sSf | sh -s -- -y && echo 1.93.1 && \\
     rustup target add aarch64-unknown-linux-gnu && \\
-    cargo install cargo-deb cargo-generate-rpm
+    cargo install cargo-deb
 
 # Configure cross-compilation
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \\
@@ -535,26 +621,16 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \\
 # Rust install: native (amd64) — compile cargo-deb/cargo-generate-rpm from source
 RUST_INSTALL_NATIVE = """\
 RUN --mount=type=cache,target=/root/.cargo/registry curl https://sh.rustup.rs -sSf | sh -s -- -y && echo 1.93.1 && \\
-    cargo install cargo-deb cargo-generate-rpm"""
+    cargo install {packaging_tool}"""
 
-# Rust install: emulated (arm64) — only install Rust itself, skip packaging tools
-# cargo-deb and cargo-generate-rpm are cross-compiled in a separate amd64 stage
+# Rust install: emulated (arm64) — install Rust and packaging tools natively.
+# This is slower than cross-compiling the packaging tools, but avoids copying
+# dynamically linked Debian tooling into Fedora/Rocky/SUSE/Amazon containers.
 # CFLAGS=-O2: prevent gcc segfaults under QEMU emulation (gcc -O3 triggers QEMU bugs)
 RUST_INSTALL_EMULATED = """\
 ENV CFLAGS="-O2" CXXFLAGS="-O2"
-RUN --mount=type=cache,target=/root/.cargo/registry curl https://sh.rustup.rs -sSf | sh -s -- -y && echo 1.93.1
-COPY --from=tooling /usr/local/cargo/bin/cargo-deb /root/.cargo/bin/cargo-deb
-COPY --from=tooling /usr/local/cargo/bin/cargo-generate-rpm /root/.cargo/bin/cargo-generate-rpm"""
-
-# Cross-compilation stage: build cargo-deb and cargo-generate-rpm for aarch64 on amd64
-TOOLING_STAGE_TPL = """\
-FROM --platform=linux/amd64 rust:latest AS tooling
-RUN apt-get update && apt-get install -y gcc-aarch64-linux-gnu && rm -rf /var/lib/apt/lists/*
-RUN rustup target add aarch64-unknown-linux-gnu
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-RUN cargo install --target aarch64-unknown-linux-gnu cargo-deb cargo-generate-rpm
-
-"""
+RUN --mount=type=cache,target=/root/.cargo/registry curl https://sh.rustup.rs -sSf | sh -s -- -y && echo 1.93.1 && \\
+    cargo install {packaging_tool}"""
 
 # Ubuntu codename mapping (used for multiarch apt sources)
 UBUNTU_CODENAMES = {
@@ -625,23 +701,6 @@ RUN sed -i 's/^deb http/deb [arch=amd64] http/' /etc/apt/sources.list && \\
 """
 
 
-SLE_CONNECT_TPL = """\
-# Install SUSEConnect and dependencies for registration
-RUN zypper --non-interactive refresh && \\
-    zypper --non-interactive install --no-recommends \\
-        SUSEConnect \\
-        ca-certificates \\
-        suse-build-key && \\
-    zypper clean --all
-
-RUN --mount=type=secret,id=scc_regcode,dst=/run/secrets/scc_regcode \\
-    set -e && \\
-    source /run/secrets/scc_regcode && \\
-    SUSEConnect --email "$email" --regcode "$regcode" && \\
-    SUSEConnect -p PackageHub/{scc_vers}/$(uname -m)
-"""
-
-
 def build_pkg_list(dist_cfg, selinux):
     fam = FAMILIES[dist_cfg["family"]]
     pkgs = list(fam["pkgs"])
@@ -666,6 +725,7 @@ def render(
     dist_cfg,
     patch_libhimmelblau,
     arch="amd64",
+    with_orchestrator=False,
 ):
     fam = FAMILIES[dist_cfg["family"]]
     selinux = bool(dist_cfg.get("selinux", False))
@@ -676,7 +736,10 @@ def render(
     else:
         bootstrap = fam["bootstrap"].rstrip()
     env = fam["env"] or ""
-    sle_connect = SLE_CONNECT_TPL.format(scc_vers=dist_cfg.get("scc_vers")) if dist_cfg.get("scc") else ""
+    if dist_cfg["family"] != "ebuild":
+        # Cargo build scripts must preserve the same config/example selection
+        # when they regenerate files during package builds.
+        env = "\n".join(filter(None, [env, f"ENV WITH_ORCHESTRATOR={int(with_orchestrator)}"]))
 
     # Features
     tpm = bool(dist_cfg.get("tpm", False))
@@ -694,15 +757,23 @@ def render(
             features,
             dist_name,
             cross_target=cross_target,
+            with_orchestrator=with_orchestrator,
         )
     elif dist_name == "test":
-        final_cmd = "CMD cargo test"
+        final_cmd = "CMD python3 scripts/test_hsm_pin_init.py && cargo test"
+        if with_orchestrator:
+            # Include the opt-in crate without dropping the default members.
+            final_cmd += " --workspace"
     elif dist_cfg["family"] == "ebuild":
         # Ebuild generation - lightweight, just runs gen_ebuild.py
         repo_root = Path(__file__).parent.parent.resolve()
-        final_cmd = build_gentoo_final_cmd(features, repo_root)
+        final_cmd = build_gentoo_final_cmd(features, repo_root, with_orchestrator)
+    elif dist_cfg["family"] == "arch":
+        final_cmd = build_arch_final_cmd()
     else:
-        final_cmd = build_rpm_final_cmd(features, selinux, bool(dist_cfg.get("apparmor", False)))
+        final_cmd = build_rpm_final_cmd(
+            features, selinux, bool(dist_cfg.get("apparmor", False)), with_orchestrator,
+        )
 
     blocks = []
     if dist_cfg.get("extra_prep"):
@@ -732,13 +803,21 @@ def render(
         return df
 
     # Select Rust install method and tooling stage based on architecture
-    if arch != "amd64":
-        # arm64 RPM/zypper: cross-compile packaging tools on amd64, copy into arm64 stage
-        rust_install = RUST_INSTALL_EMULATED
-        tooling_stage = TOOLING_STAGE_TPL
+    if dist_cfg["family"] in ("arch", "ebuild"):
+        # Arch installs rust with pacman and packages with makepkg, so it needs
+        # neither a rustup toolchain nor cargo-deb/cargo-generate-rpm.
+        # Ebuild generation also needs no Rust toolchain or packaging tools.
+        rust_install = ""
+        tooling_stage = ""
+    elif arch != "amd64":
+        # arm64 RPM/zypper: run under QEMU and compile packaging tools natively
+        # inside the target distro image. Cross-built tools from a Debian
+        # tooling stage can fail to execute on RPM-family images.
+        rust_install = RUST_INSTALL_EMULATED.format(packaging_tool=fam["packaging_tool"])
+        tooling_stage = ""
     else:
         # amd64: compile packaging tools natively
-        rust_install = RUST_INSTALL_NATIVE
+        rust_install = RUST_INSTALL_NATIVE.format(packaging_tool=fam["packaging_tool"])
         tooling_stage = ""
 
     # Use minimal template for ebuild generation
@@ -756,7 +835,6 @@ def render(
             env=env,
             bootstrap=(extra + bootstrap),
             post_bootstrap=post_bootstrap,
-            sle_connect=("\n" + sle_connect + "\n" if sle_connect else ""),
             rust_install=rust_install,
             selinux_enabled=("ENV HIMMELBLAU_ALLOW_MISSING_SELINUX=1" if not selinux else ""),
             patch_libhimmelblau="COPY ./scripts/cargo-patch-config.toml /root/.cargo/config.toml" if patch_libhimmelblau else "",
@@ -769,6 +847,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="./dockerfiles", help="Output directory")
     ap.add_argument("--only", default="", help="Comma-separated list of dists to render")
+    ap.add_argument(
+        "--with-orchestrator", action="store_true",
+        help="Build the experimental himmelblau-orchestrator package and include its config options",
+    )
     ap.add_argument(
         "--arch", default="amd64",
         choices=sorted(ARCH_MAP.keys()),
@@ -814,6 +896,7 @@ def main():
             DISTS[name],
             args.patch_libhimmelblau,
             arch=args.arch,
+            with_orchestrator=args.with_orchestrator,
         )
         path = os.path.join(args.out, f"Dockerfile.{name}{arch_suffix}")
         with open(path, "w", encoding="utf-8") as f:
