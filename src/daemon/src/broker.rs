@@ -18,8 +18,9 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use himmelblau_unix_common::idprovider::himmelblau::HimmelblauMultiProvider;
+use himmelblau_unix_common::config::HimmelblauConfig;
 use himmelblau_unix_common::idprovider::interface::Id;
+use himmelblau_unix_common::idprovider::IdProviderProxy;
 use himmelblau_unix_common::resolver::Resolver;
 use identity_dbus_broker::HimmelblauBroker;
 use libc::uid_t;
@@ -63,8 +64,15 @@ struct TokenReq {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct SsoCookieAuthParametersReq {
+    account: Option<AccountReq>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct SsoCookieReq {
-    account: AccountReq,
+    account: Option<AccountReq>,
+    #[serde(rename = "authParameters")]
+    auth_parameters: Option<SsoCookieAuthParametersReq>,
     #[serde(rename = "ssoUrl")]
     sso_url: Option<String>,
 }
@@ -102,7 +110,18 @@ fn build_req_cnf(pop_params: &Option<PopParamsReq>) -> Option<String> {
 
 #[derive(Clone)]
 pub(crate) struct Broker {
-    pub(crate) cachelayer: Arc<Resolver<HimmelblauMultiProvider>>,
+    pub(crate) cachelayer: Arc<Resolver<IdProviderProxy>>,
+    pub(crate) config_path: String,
+}
+
+impl Broker {
+    fn environment_for_account(&self, account_id: &str) -> Result<String, Box<dyn Error>> {
+        // Domain discovery can update the server-generated config after startup.
+        let config = HimmelblauConfig::new(Some(&self.config_path))?;
+        config
+            .get_broker_environment_for_account(account_id)
+            .ok_or_else(|| "Unable to resolve account authority".into())
+    }
 }
 
 #[async_trait]
@@ -204,10 +223,11 @@ impl HimmelblauBroker for Broker {
             .await
             .map_err(|_| "Unable to load account")?
             .ok_or("Unable to find account")?;
+        let authority_host = self.environment_for_account(&user.spn)?;
         let res = json!({
             "accounts": [
                 {
-                    "environment": "login.windows.net",
+                    "environment": authority_host,
                     "givenName": user.displayname,
                     "homeAccountId": format!("{}.{}", user.uuid.to_string(), user.tenant_id.map(|uuid| uuid.to_string()).unwrap_or("".to_string())),
                     "localAccountId": user.uuid.to_string(),
@@ -245,9 +265,14 @@ impl HimmelblauBroker for Broker {
             .await
             .map_err(|_| "Unable to load account")?
             .ok_or("Unable to find account")?;
+        let authority_host = self.environment_for_account(&user.spn)?;
         let request: SsoCookieReq =
             serde_json::from_str(&request_json).map_err(|e| format!("{:?}", e))?;
-        if request.account.username.to_lowercase() != user.spn.to_lowercase() {
+        let account = request
+            .account
+            .or_else(|| request.auth_parameters.and_then(|params| params.account))
+            .ok_or("Missing account")?;
+        if account.username.to_lowercase() != user.spn.to_lowercase() {
             return Err("Invalid request for user!".into());
         }
         // Extract sso_nonce from the ssoUrl query parameter if present.
@@ -263,7 +288,7 @@ impl HimmelblauBroker for Broker {
             .ok_or("Failed to fetch prt sso cookie")?;
         let res = json!({
             "account": {
-                "environment": "login.microsoftonline.com",
+                "environment": authority_host,
                 "homeAccountId": format!("{}.{}", user.uuid.to_string(), user.tenant_id.map(|uuid| uuid.to_string()).unwrap_or("".to_string())),
                 "localAccountId": user.uuid.to_string(),
                 "realm": user.tenant_id.map(|uuid| uuid.to_string()).unwrap_or("".to_string()),
@@ -306,5 +331,25 @@ impl HimmelblauBroker for Broker {
             "linuxBrokerVersion": env!("CARGO_PKG_VERSION"),
         });
         Ok(res.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SsoCookieReq;
+    use serde_json::json;
+
+    #[test]
+    fn sso_cookie_accepts_evolution_request() {
+        let request: SsoCookieReq = serde_json::from_value(json!({
+            "authParameters": { "account": { "username": "alice@example.com" } },
+            "ssoUrl": "https://login.microsoftonline.com/common/oauth2/authorize"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.auth_parameters.unwrap().account.unwrap().username,
+            "alice@example.com"
+        );
     }
 }

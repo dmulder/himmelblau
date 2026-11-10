@@ -20,11 +20,13 @@ use crate::i18n::tr;
 use crate::unix_passwd::parse_etc_passwd;
 use configparser::ini::Ini;
 use oauth2::url;
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Error;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, error};
 
@@ -34,13 +36,14 @@ use crate::constants::{
     DEFAULT_CONSOLE_PASSWORD_ONLY, DEFAULT_DB_PATH, DEFAULT_FIDO_TIMEOUT, DEFAULT_HELLO_ENABLED,
     DEFAULT_HELLO_PIN_MIN_LEN, DEFAULT_HELLO_PIN_RETRY_COUNT, DEFAULT_HOME_ALIAS,
     DEFAULT_HOME_ATTR, DEFAULT_HOME_PREFIX, DEFAULT_HSM_PIN_PATH, DEFAULT_ID_ATTR_MAP,
-    DEFAULT_JOIN_TYPE, DEFAULT_MFA_POLL_PROMPT_SERVICES, DEFAULT_ODC_PROVIDER,
-    DEFAULT_OFFLINE_BREAKGLASS_TTL, DEFAULT_ORCHESTRATOR_SOCK_PATH,
-    DEFAULT_PASSWORD_ONLY_REMOTE_SERVICES_DENY_LIST, DEFAULT_POLICIES_DB_DIR,
-    DEFAULT_REQUEST_TIMEOUT, DEFAULT_SELINUX, DEFAULT_SFA_FALLBACK_ENABLED, DEFAULT_SHELL,
-    DEFAULT_SOCK_PATH, DEFAULT_TASK_SOCK_PATH, DEFAULT_TPM_TCTI_NAME, DEFAULT_USER_MAP_FILE,
-    DEFAULT_USE_ETC_SKEL, MAPPED_NAME_CACHE, NSS_IGNORE_EXACT, NSS_IGNORE_PREFIX,
-    SERVER_CONFIG_PATH,
+    DEFAULT_JOIN_TYPE, DEFAULT_LOCAL_GROUPS_RECONCILE_INTERVAL, DEFAULT_LOGON_SCRIPT_TIMEOUT,
+    DEFAULT_MFA_POLL_PROMPT_SERVICES, DEFAULT_ODC_PROVIDER, DEFAULT_OFFLINE_BREAKGLASS_TTL,
+    DEFAULT_ORCHESTRATOR_SOCK_PATH, DEFAULT_PASSWORD_ONLY_REMOTE_SERVICES_DENY_LIST,
+    DEFAULT_POLICIES_DB_DIR, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SELINUX,
+    DEFAULT_SFA_FALLBACK_ENABLED, DEFAULT_SHELL, DEFAULT_SOCK_PATH, DEFAULT_TASK_SOCK_PATH,
+    DEFAULT_TPM_TCTI_NAME, DEFAULT_USER_MAP_FILE, DEFAULT_USE_ETC_SKEL, MAPPED_NAME_CACHE,
+    NSS_IGNORE_EXACT, NSS_IGNORE_PREFIX, RUNTIME_CONFIG_PATH, SERVER_CONFIG_PATH,
+    VENDOR_CONFIG_PATH,
 };
 use crate::mapping::{MappedNameCache, Mode};
 use crate::unix_config::{HomeAttr, HsmType};
@@ -50,6 +53,7 @@ use idmap::{DEFAULT_IDMAP_RANGE, DEFAULT_SUBID_RANGE};
 use reqwest::Url;
 use serde::Deserialize;
 use std::env;
+use std::time::Duration;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum IdAttr {
@@ -69,6 +73,15 @@ pub enum IpVersionSelection {
     Both,
     Ipv4Only,
     Ipv6Only,
+}
+
+/// Which supplementary groups NSS initgroups publishes.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum InitgroupsMode {
+    /// Only groups that resolve to an NSS name.
+    Named,
+    /// Every cached group GID, including ones getgrgid cannot name.
+    Full,
 }
 
 impl From<JoinType> for u32 {
@@ -150,14 +163,19 @@ struct FederationProvider {
 async fn request_federation_provider(
     odc_provider: &str,
     domain: &str,
+    request_timeout_secs: u64,
 ) -> Result<(String, String, String), MsalError> {
+    let request_timeout = Duration::from_secs(request_timeout_secs);
+    let connect_timeout = std::cmp::min(request_timeout / 2, Duration::from_secs(3));
     let client = reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
         .build()
         .map_err(|e| MsalError::RequestFailed(format!("{:?}", e)))?;
 
     let url = Url::parse_with_params(
         &format!("https://{}/odc/v2.1/federationProvider", odc_provider),
-        &[("domain", domain)],
+        [("domain", domain)],
     )
     .map_err(|e| MsalError::RequestFailed(format!("{:?}", e)))?;
 
@@ -191,6 +209,7 @@ async fn request_federation_provider(
 pub struct HimmelblauConfig {
     config: Ini,
     filename: String,
+    effective_config_paths: Vec<PathBuf>,
 }
 
 fn str_to_home_attr(attrib: &str) -> HomeAttr {
@@ -220,6 +239,128 @@ fn match_bool(val: Option<String>, default: bool) -> bool {
     }
 }
 
+fn path_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to inspect {}: {}", path.display(), error)),
+    }
+}
+
+fn symlink_points_to_dev_null(path: &Path) -> bool {
+    matches!(fs::read_link(path), Ok(target) if target == Path::new("/dev/null"))
+}
+
+fn is_mask(path: &Path) -> Result<bool, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect {}: {}", path.display(), error))?;
+
+    if metadata.file_type().is_symlink() {
+        return Ok(symlink_points_to_dev_null(path));
+    }
+
+    Ok(metadata.is_file() && metadata.len() == 0)
+}
+
+fn drop_in_dir(config_path: &Path) -> PathBuf {
+    let mut path = config_path.as_os_str().to_os_string();
+    path.push(".d");
+    PathBuf::from(path)
+}
+
+fn collect_drop_ins(config_paths: &[PathBuf]) -> Result<BTreeMap<OsString, PathBuf>, String> {
+    let mut drop_ins = BTreeMap::new();
+
+    for config_path in config_paths {
+        let directory = drop_in_dir(config_path);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to read drop-in directory {}: {}",
+                    directory.display(),
+                    error
+                ))
+            }
+        };
+
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "failed to read drop-in directory {}: {}",
+                    directory.display(),
+                    error
+                )
+            })?;
+            let path = entry.path();
+            if path.extension() != Some(OsStr::new("conf")) {
+                continue;
+            }
+
+            let file_type = entry.file_type().map_err(|error| {
+                format!("failed to inspect drop-in {}: {}", path.display(), error)
+            })?;
+            let is_config_file = file_type.is_file()
+                || (file_type.is_symlink()
+                    && (symlink_points_to_dev_null(&path)
+                        || fs::metadata(&path)
+                            .map(|metadata| metadata.is_file())
+                            .unwrap_or(false)));
+            if is_config_file {
+                drop_ins.insert(entry.file_name(), path);
+            }
+        }
+    }
+
+    Ok(drop_ins)
+}
+
+fn load_config_file(config: &mut Ini, path: &Path) -> Result<(), String> {
+    let filename = path
+        .to_str()
+        .ok_or_else(|| format!("configuration path is not valid UTF-8: {}", path.display()))?;
+    config
+        .load_and_append(filename)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "failed to read config from {} - cannot start up: {} Quitting.",
+                path.display(),
+                error
+            )
+        })
+}
+
+fn load_config_hierarchy(
+    config: &mut Ini,
+    config_paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let mut effective_config_paths = Vec::new();
+    let mut main_config = None;
+    for path in config_paths {
+        if path_exists(path)? {
+            main_config = Some(path);
+        }
+    }
+
+    if let Some(path) = main_config {
+        effective_config_paths.push(path.clone());
+        if !is_mask(path)? {
+            load_config_file(config, path)?;
+        }
+    }
+
+    for path in collect_drop_ins(config_paths)?.values() {
+        effective_config_paths.push(path.clone());
+        if !is_mask(path)? {
+            load_config_file(config, path)?;
+        }
+    }
+
+    Ok(effective_config_paths)
+}
+
 impl HimmelblauConfig {
     pub fn new(config_path: Option<&str>) -> Result<HimmelblauConfig, String> {
         let mut sconfig = Ini::new();
@@ -228,18 +369,17 @@ impl HimmelblauConfig {
             filename = config_path.to_string();
         }
         let cfg_path: PathBuf = PathBuf::from(filename.clone());
-        if cfg_path.exists() {
-            match sconfig.load(filename.clone()) {
-                Ok(l) => l,
-                Err(e) => {
-                    return Err(format!(
-                        "failed to read config from {} - cannot start up: {} Quitting.",
-                        filename.clone(),
-                        e
-                    ))
-                }
-            };
-        }
+        let config_paths = if filename == DEFAULT_CONFIG_PATH {
+            vec![
+                PathBuf::from(VENDOR_CONFIG_PATH),
+                PathBuf::from(RUNTIME_CONFIG_PATH),
+                cfg_path,
+            ]
+        } else {
+            vec![cfg_path]
+        };
+        let effective_config_paths = load_config_hierarchy(&mut sconfig, &config_paths)?;
+
         // Apply server generated config (generated during domain join)
         let srv_cfg_path: PathBuf = PathBuf::from(SERVER_CONFIG_PATH.to_string());
         if srv_cfg_path.exists() {
@@ -253,6 +393,7 @@ impl HimmelblauConfig {
         Ok(HimmelblauConfig {
             config: sconfig,
             filename,
+            effective_config_paths,
         })
     }
 
@@ -414,6 +555,33 @@ impl HimmelblauConfig {
         }
     }
 
+    /// Resolve a user's configured domain (including a known alias) before
+    /// selecting its authority. OIDC accounts use the configured issuer host,
+    /// regardless of whether their account-name claim contains a domain.
+    /// The server-generated config is already merged into this configuration by `new`.
+    pub fn get_authority_host_for_account(&self, account_id: &str) -> Option<String> {
+        if let Some(issuer) = self.get_oidc_issuer_url() {
+            let issuer = url::Url::parse(&issuer).ok()?;
+            return issuer.host_str().map(str::to_string);
+        }
+        let (_, domain) = split_username(account_id)?;
+        let domain = self
+            .get_primary_domain_from_alias_simple(domain)
+            .unwrap_or_else(|| domain.to_string());
+        Some(self.get_authority_host(&domain))
+    }
+
+    /// Broker environments are endpoint authorities, so preserve an OIDC issuer's
+    /// nondefault port. FIDO RP IDs continue to use the hostname-only accessor.
+    pub fn get_broker_environment_for_account(&self, account_id: &str) -> Option<String> {
+        if let Some(issuer) = self.get_oidc_issuer_url() {
+            let issuer = url::Url::parse(&issuer).ok()?;
+            issuer.host_str()?;
+            return Some(issuer[url::Position::BeforeHost..url::Position::AfterPort].to_string());
+        }
+        self.get_authority_host_for_account(account_id)
+    }
+
     pub fn get_tenant_id(&self, domain: &str) -> Option<String> {
         self.config.get(domain, "tenant_id")
     }
@@ -496,6 +664,12 @@ impl HimmelblauConfig {
         }
     }
 
+    /// Whether user discovery and enrollment auth request the Microsoft Intune
+    /// resource instead of the Microsoft Intune Enrollment resource.
+    pub fn get_use_intune_auth_resource(&self) -> bool {
+        self.get_apply_policy() || self.get_intune_auth_resource()
+    }
+
     pub fn write(&self) -> Result<(), Error> {
         self.config.write(self.filename.clone())
     }
@@ -551,8 +725,27 @@ impl HimmelblauConfig {
         domains
     }
 
+    pub fn get_configured_entra_domains(&self) -> Vec<String> {
+        // The array returned by get_configured_domains() might include the
+        // "oidc" section, or an empty entry from a blank `domain =` option.
+        self.get_configured_domains()
+            .into_iter()
+            .filter(|x| !x.is_empty() && x != "oidc")
+            .collect()
+    }
+
+    /// Himmelblau supports a single Entra ID domain. If several are
+    /// configured the first one is used.
+    pub fn get_configured_entra_domain(&self) -> Option<String> {
+        self.get_configured_entra_domains().into_iter().next()
+    }
+
     pub fn get_config_file(&self) -> String {
         self.filename.clone()
+    }
+
+    pub fn get_effective_config_paths(&self) -> &[PathBuf] {
+        &self.effective_config_paths
     }
 
     pub fn get_id_attr_map(&self) -> IdAttr {
@@ -615,7 +808,7 @@ impl HimmelblauConfig {
             let domain_aliases = match self.config.get(domain, "domain_aliases") {
                 Some(aliases) => aliases
                     .split(",")
-                    .map(|s| s.to_string().to_lowercase())
+                    .map(|s| s.trim().to_lowercase())
                     .collect(),
                 None => vec![],
             };
@@ -658,31 +851,39 @@ impl HimmelblauConfig {
 
         // We don't recognize this alias, so now we need to search for it the
         // hard way by checking for matching tenant id's.
-        let (_, alias_tenant_id, _) =
-            match request_federation_provider(DEFAULT_ODC_PROVIDER, alias).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!(
-                        "Failed matching alias '{}' to a configured tenant: {:?}",
-                        alias, e
-                    );
-                    return None;
-                }
-            };
+        let (_, alias_tenant_id, _) = match request_federation_provider(
+            DEFAULT_ODC_PROVIDER,
+            alias,
+            self.get_request_timeout(),
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!(
+                    "Failed matching alias '{}' to a configured tenant: {:?}",
+                    alias, e
+                );
+                return None;
+            }
+        };
         for domain in domains {
             let tenant_id = match self.get_tenant_id(&domain) {
                 Some(tenant_id) => tenant_id,
                 None => {
-                    let (authority_host, tenant_id, graph_url) =
-                        match request_federation_provider(&self.get_odc_provider(&domain), &domain)
-                            .await
-                        {
-                            Ok(resp) => resp,
-                            Err(e) => {
-                                error!("Failed sending federation provider request: {:?}", e);
-                                continue;
-                            }
-                        };
+                    let (authority_host, tenant_id, graph_url) = match request_federation_provider(
+                        &self.get_odc_provider(&domain),
+                        &domain,
+                        self.get_request_timeout(),
+                    )
+                    .await
+                    {
+                        Ok(resp) => resp,
+                        Err(e) => {
+                            error!("Failed sending federation provider request: {:?}", e);
+                            continue;
+                        }
+                    };
                     self.set(&domain, "authority_host", &authority_host);
                     self.set(&domain, "tenant_id", &tenant_id);
                     self.set(&domain, "graph_url", &graph_url);
@@ -720,7 +921,7 @@ impl HimmelblauConfig {
     fn map_name_to_upn_impl(&self, account_id: &str, passwd_path: &str) -> Option<String> {
         let name_mapping_script = self.get_name_mapping_script();
         let cn_name_mapping = self.get_cn_name_mapping();
-        let domains = self.get_configured_domains();
+        let domain = self.get_configured_entra_domain();
 
         if account_id.trim().is_empty() {
             return None;
@@ -794,8 +995,10 @@ impl HimmelblauConfig {
                 }
             }
         }
-        if cn_name_mapping && !account_id.contains('@') && !domains.is_empty() {
-            return Some(format!("{}@{}", account_id, domains[0]));
+        if cn_name_mapping && !account_id.contains('@') {
+            if let Some(domain) = domain {
+                return Some(format!("{}@{}", account_id, domain));
+            }
         }
         Some(account_id.to_string())
     }
@@ -808,10 +1011,8 @@ impl HimmelblauConfig {
     pub fn map_upn_to_name(&self, upn: &str) -> String {
         if let Some((name, domain)) = split_username(upn) {
             let primary = self
-                .get_configured_domains()
-                .first()
-                .map(|e| e.as_str())
-                .unwrap_or("")
+                .get_configured_entra_domain()
+                .unwrap_or_default()
                 .to_lowercase();
             let res;
             if self.get_name_mapping_script().is_some() {
@@ -895,6 +1096,8 @@ mod tests {
     use super::*;
     use std::env;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     // Helper function to create temporary configuration files
     fn create_temp_config(contents: &str) -> String {
@@ -914,6 +1117,111 @@ mod tests {
     fn create_empty_config() -> HimmelblauConfig {
         let temp_file = create_temp_config("");
         HimmelblauConfig::new(Some(&temp_file)).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn write_temp_config(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).expect("Failed to create config directory");
+        fs::write(path, contents).expect("Failed to write temporary config file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_config_hierarchy_precedence_and_masking() {
+        let root = env::temp_dir().join(format!(
+            "himmelblau_test_config_hierarchy_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vendor = root.join("usr/lib/himmelblau/himmelblau.conf");
+        let runtime = root.join("run/himmelblau/himmelblau.conf");
+        let local = root.join("etc/himmelblau/himmelblau.conf");
+
+        write_temp_config(
+            &vendor,
+            "[global]\nvalue = vendor-main\nmain_only = ignored\n",
+        );
+        write_temp_config(&runtime, "[global]\nvalue = runtime-main\n");
+
+        let mut main_config = Ini::new();
+        let effective_config_paths = load_config_hierarchy(
+            &mut main_config,
+            &[vendor.clone(), runtime.clone(), local.clone()],
+        )
+        .unwrap();
+        assert_eq!(effective_config_paths, vec![runtime.clone()]);
+        assert_eq!(
+            main_config.get("global", "value").as_deref(),
+            Some("runtime-main")
+        );
+        assert_eq!(main_config.get("global", "main_only"), None);
+
+        write_temp_config(&local, "");
+
+        write_temp_config(
+            &drop_in_dir(&vendor).join("10-masked.conf"),
+            "[global]\nmasked = no\n",
+        );
+        let masked_drop_in = drop_in_dir(&local).join("10-masked.conf");
+        fs::create_dir_all(masked_drop_in.parent().unwrap())
+            .expect("Failed to create local drop-in directory");
+        symlink("/dev/null", masked_drop_in).expect("Failed to create drop-in mask");
+
+        write_temp_config(
+            &drop_in_dir(&local).join("20-local.conf"),
+            "[global]\nvalue = local-drop-in\nlocal_only = retained\n",
+        );
+        write_temp_config(
+            &drop_in_dir(&vendor).join("30-late.conf"),
+            "[global]\nvalue = vendor-late\n",
+        );
+        write_temp_config(
+            &drop_in_dir(&runtime).join("30-late.conf"),
+            "[global]\nvalue = runtime-late\n",
+        );
+        let linked_drop_in = root.join("linked.conf");
+        write_temp_config(&linked_drop_in, "[global]\nlinked = loaded\n");
+        symlink(linked_drop_in, drop_in_dir(&vendor).join("35-linked.conf"))
+            .expect("Failed to create regular-file drop-in symlink");
+
+        let directory_target = root.join("directory-target");
+        fs::create_dir_all(&directory_target).expect("Failed to create symlink target directory");
+        symlink(
+            directory_target,
+            drop_in_dir(&vendor).join("36-directory.conf"),
+        )
+        .expect("Failed to create directory drop-in symlink");
+        symlink(
+            root.join("missing.conf"),
+            drop_in_dir(&vendor).join("37-broken.conf"),
+        )
+        .expect("Failed to create broken drop-in symlink");
+
+        write_temp_config(
+            &drop_in_dir(&local).join("40-ignored.ini"),
+            "[global]\nvalue = wrong-suffix\n",
+        );
+        write_temp_config(
+            &drop_in_dir(&local).join("50-nested.conf.d/60-ignored.conf"),
+            "[global]\nvalue = nested\n",
+        );
+
+        let mut config = Ini::new();
+        let _effective_config_paths =
+            load_config_hierarchy(&mut config, &[vendor, runtime, local]).unwrap();
+
+        assert_eq!(
+            config.get("global", "value").as_deref(),
+            Some("runtime-late")
+        );
+        assert_eq!(
+            config.get("global", "local_only").as_deref(),
+            Some("retained")
+        );
+        assert_eq!(config.get("global", "main_only"), None);
+        assert_eq!(config.get("global", "masked"), None);
+        assert_eq!(config.get("global", "linked").as_deref(), Some("loaded"));
+
+        fs::remove_dir_all(root).expect("Failed to remove config hierarchy");
     }
 
     #[test]
@@ -1112,10 +1420,38 @@ mod tests {
 
         let config_empty = create_empty_config();
         assert_eq!(config_empty.get_ip_version(), IpVersionSelection::Both);
+        assert_eq!(config_empty.get_initgroups_mode(), InitgroupsMode::Named);
         assert_eq!(
             config_empty.get_ip_versions(),
             vec![IpVersion::V4, IpVersion::V6]
         );
+    }
+
+    #[test]
+    fn test_get_initgroups_mode() {
+        let named = r#"
+        [global]
+        initgroups_mode = named
+        "#;
+        let temp_file = create_temp_config(named);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(config.get_initgroups_mode(), InitgroupsMode::Named);
+
+        let full = r#"
+        [global]
+        initgroups_mode = full
+        "#;
+        let temp_file = create_temp_config(full);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(config.get_initgroups_mode(), InitgroupsMode::Full);
+
+        let invalid = r#"
+        [global]
+        initgroups_mode = debug
+        "#;
+        let temp_file = create_temp_config(invalid);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(config.get_initgroups_mode(), InitgroupsMode::Named);
     }
 
     #[test]
@@ -1139,15 +1475,44 @@ mod tests {
     fn test_get_apply_policy() {
         let config_data = r#"
         [global]
-        apply_policy = false
+        apply_policy = true
         "#;
 
         let temp_file = create_temp_config(config_data);
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
-        assert_eq!(config.get_apply_policy(), false);
+        assert_eq!(config.get_apply_policy(), true);
         let config_empty = create_empty_config();
-        assert_eq!(config_empty.get_apply_policy(), true);
+        assert_eq!(config_empty.get_apply_policy(), false);
+    }
+
+    #[test]
+    fn test_get_intune_auth_resource() {
+        let config_data = r#"
+        [global]
+        intune_auth_resource = true
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        assert_eq!(config.get_intune_auth_resource(), true);
+        assert_eq!(config.get_apply_policy(), false);
+        assert_eq!(config.get_use_intune_auth_resource(), true);
+        let config_empty = create_empty_config();
+        assert_eq!(config_empty.get_intune_auth_resource(), false);
+        assert_eq!(config_empty.get_use_intune_auth_resource(), false);
+
+        let apply_policy_data = r#"
+        [global]
+        apply_policy = true
+        "#;
+
+        let apply_policy_file = create_temp_config(apply_policy_data);
+        let apply_policy = HimmelblauConfig::new(Some(&apply_policy_file)).unwrap();
+
+        assert_eq!(apply_policy.get_intune_auth_resource(), false);
+        assert_eq!(apply_policy.get_use_intune_auth_resource(), true);
     }
 
     #[test]
@@ -1395,6 +1760,68 @@ mod tests {
     }
 
     #[test]
+    fn test_get_configured_entra_domain() {
+        // The first entry of `domains` is used
+        let temp_file = create_temp_config(
+            r#"
+        [global]
+        domains = example.com,test.com
+
+        [test.com]
+        [example.com]
+        "#,
+        );
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(
+            config.get_configured_entra_domain(),
+            Some("example.com".to_string())
+        );
+
+        // The oidc section is never an Entra domain
+        let temp_file = create_temp_config(
+            r#"
+        [global]
+        oidc_issuer_url = https://issuer.example.com
+
+        [oidc]
+        "#,
+        );
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(config.get_configured_entra_domain(), None);
+
+        // A blank domain option is not a domain
+        let temp_file = create_temp_config(
+            r#"
+        [global]
+        domain =
+        oidc_issuer_url = https://issuer.example.com
+
+        [oidc]
+        "#,
+        );
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(config.get_configured_entra_domain(), None);
+
+        // Additional domains are listed, but only the first is used
+        let temp_file = create_temp_config(
+            r#"
+        [global]
+        domains = example.com,test.com
+        "#,
+        );
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(
+            config.get_configured_entra_domains(),
+            vec!["example.com", "test.com"]
+        );
+
+        // No configuration at all
+        let temp_file = create_temp_config("[global]\n");
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(config.get_configured_entra_domain(), None);
+    }
+
+    #[test]
     fn test_get_enable_hello() {
         let config_data = r#"
         [global]
@@ -1496,21 +1923,89 @@ mod tests {
     fn test_get_authority_host() {
         let config_data = r#"
         [example.com]
-        authority_host = https://login.suse.com
+        authority_host = login.suse.com
         "#;
 
         let temp_file = create_temp_config(config_data);
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
-        assert_eq!(
-            config.get_authority_host("example.com"),
-            "https://login.suse.com"
-        );
+        assert_eq!(config.get_authority_host("example.com"), "login.suse.com");
         let config_empty = create_empty_config();
         assert_eq!(
             config_empty.get_authority_host("example.com"),
             DEFAULT_AUTHORITY_HOST
         );
+    }
+
+    #[test]
+    fn test_get_authority_host_for_account_resolves_aliases() {
+        let temp_file = create_temp_config(
+            "[global]\ndomains = example.com\n[example.com]\nauthority_host = login.microsoftonline.us\ndomain_aliases = first.example.com, ALIAS.example.com  , third.example.com\n",
+        );
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(
+            config.get_authority_host_for_account("alice@alias.example.com"),
+            Some("login.microsoftonline.us".to_string())
+        );
+        assert_eq!(config.get_authority_host_for_account("alice"), None);
+    }
+
+    #[test]
+    fn test_get_authority_host_for_oidc_accounts_uses_issuer() {
+        let temp_file = create_temp_config(
+            "[global]\noidc_issuer_url = https://id.example.org/realms/example/.well-known/openid-configuration\n",
+        );
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        for account in ["alice", "alice@unrelated.example.com"] {
+            assert_eq!(
+                config.get_authority_host_for_account(account),
+                Some("id.example.org".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_broker_environment_preserves_oidc_ports() {
+        for (issuer, environment, host) in [
+            (
+                "https://id.example.org:8443/realm",
+                "id.example.org:8443",
+                "id.example.org",
+            ),
+            (
+                "https://id.example.org/realm",
+                "id.example.org",
+                "id.example.org",
+            ),
+            ("https://[::1]:8443/realm", "[::1]:8443", "[::1]"),
+        ] {
+            let contents = format!("[global]\noidc_issuer_url = {issuer}\n");
+            let temp_file = create_temp_config(&contents);
+            let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+            for account in ["alice", "alice@other.example"] {
+                assert_eq!(
+                    config.get_broker_environment_for_account(account),
+                    Some(environment.to_string())
+                );
+                assert_eq!(
+                    config.get_authority_host_for_account(account),
+                    Some(host.to_string())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_broker_environment_preserves_entra_alias_authority() {
+        let temp_file = create_temp_config(
+            "[global]\ndomains = example.com\n[example.com]\nauthority_host = login.microsoftonline.us\ndomain_aliases = alias.example.com\n",
+        );
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(
+            config.get_broker_environment_for_account("alice@alias.example.com"),
+            Some("login.microsoftonline.us".to_string())
+        );
+        assert_eq!(config.get_broker_environment_for_account("alice"), None);
     }
 
     #[test]
@@ -1529,6 +2024,24 @@ mod tests {
         );
         let config_empty = create_empty_config();
         assert_eq!(config_empty.get_graph_url("example.com"), None);
+    }
+
+    #[test]
+    fn test_get_oidc_device_authorization_endpoint() {
+        let config_data = r#"
+        [global]
+        oidc_device_authorization_endpoint = https://idp.example.com/device/code
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+        assert_eq!(
+            config.get_oidc_device_authorization_endpoint(),
+            Some("https://idp.example.com/device/code".to_string())
+        );
+
+        let config_empty = create_empty_config();
+        assert_eq!(config_empty.get_oidc_device_authorization_endpoint(), None);
     }
 
     #[test]
@@ -1639,6 +2152,24 @@ mod tests {
     }
 
     #[test]
+    fn test_get_local_groups_reconcile_interval() {
+        let config_data = r#"
+        [global]
+        local_groups_reconcile_interval = 0
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        assert_eq!(config.get_local_groups_reconcile_interval(), 0);
+        let config_empty = create_empty_config();
+        assert_eq!(
+            config_empty.get_local_groups_reconcile_interval(),
+            DEFAULT_LOCAL_GROUPS_RECONCILE_INTERVAL
+        );
+    }
+
+    #[test]
     fn test_get_logon_script() {
         let config_data = r#"
         [global]
@@ -1654,6 +2185,24 @@ mod tests {
         );
         let config_missing = create_empty_config();
         assert_eq!(config_missing.get_logon_script(), None);
+    }
+
+    #[test]
+    fn test_get_logon_script_timeout() {
+        let config_data = r#"
+        [global]
+        logon_script_timeout = 120
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        assert_eq!(config.get_logon_script_timeout(), 120);
+        let config_empty = create_empty_config();
+        assert_eq!(
+            config_empty.get_logon_script_timeout(),
+            DEFAULT_LOGON_SCRIPT_TIMEOUT
+        );
     }
 
     #[test]
@@ -2226,6 +2775,29 @@ mod tests {
 
         let result = config.get_mfa_poll_prompt_services();
         assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_get_canonicalize_user_services_default_value() {
+        // PAM_USER is never rewritten unless services are explicitly listed.
+        let config = create_empty_config();
+
+        let result = config.get_canonicalize_user_services();
+        assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_get_canonicalize_user_services_comma_separated() {
+        let config_data = r#"
+        [global]
+        canonicalize_user_services = gdm-password , login
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        let result = config.get_canonicalize_user_services();
+        assert_eq!(result, vec!["gdm-password", "login"]);
     }
 
     // Tests for parse_ttl_to_seconds()

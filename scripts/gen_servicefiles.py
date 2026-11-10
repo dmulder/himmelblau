@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generate Himmelblau systemd unit files with version-gated directives.
+# Generate Himmelblau unit files for systemd 239 and newer.
 #
 # Example:
 #   python3 gen_systemd_units.py --out-dir platform/generated \
@@ -17,35 +17,27 @@ import subprocess
 from pathlib import Path
 from textwrap import dedent
 
-# -------- Feature Matrix (adjust as needed) -------------------
-# Conservative minimum versions for directives we toggle.
-# If unsure about a directive, keep its min low and provide a flag to force-disable.
+# TODO: bump to 252 once RHEL/CentOS/Rocky/Alma 8 are EOL
+BASELINE_VERSION = 239
+
+# Only directives introduced after the baseline need version checks.
 MINVER = {
     # Unit section
     "Upholds": 249,
     # Service section
     "FileDescriptorStorePreserve": 254,
+    # systemd/systemd@941a12dc allows socket activation while the associated
+    # service is stopped with resources pinned in its FD store.
+    "PinnedFdStoreSocketActivation": 257,
     "TypeNotifyReload": 253,   # Use Type=notify-reload when >= this; else Type=notify
-    "DynamicUser": 235,
-    "ProtectSystemStrict": 214,
-    "ReadWritePaths": 231,
-    "CapabilityBoundingSet": 21,
-    "NoNewPrivileges": 187,
-    "PrivateTmp": 1,
-    "PrivateDevices": 209,
     "ProtectHostname": 242,
     "ProtectClock": 245,
-    "ProtectKernelTunables": 232,
-    "ProtectKernelModules": 232,
     "ProtectKernelLogs": 244,
-    "ProtectControlGroups": 232,
-    "MemoryDenyWriteExecute": 231,
-    "CacheRuntimeStateDirs": 235,  # CacheDirectory/RuntimeDirectory/StateDirectory
-    "ConditionPathExists": 12,
     "LoadCredentialEncrypted": 250,
-    "FileDescriptorStoreMax": 234,
-    "StartLimitIntervalSec": 229,
-    "StartLimitBurst": 229,
+    # $SYSTEMD_ACTIVATION_UNIT (v240, systemd/systemd@d521916d) lets nss_himmelblau
+    # skip the daemon while its own unit starts; without it socket activation
+    # deadlocks (#1930). himmelblaud binds its own sockets when none are passed.
+    "SocketActivation": 240,
 }
 
 def detect_systemd_version():
@@ -69,10 +61,20 @@ def bool_env(val: str) -> bool:
     return val.lower() in ("1", "true", "yes", "on")
 
 def main():
+    """Generate the unit files for the detected or assumed systemd version.
+
+    Every directive newer than BASELINE_VERSION is gated on its MINVER entry,
+    so one source tree yields units a 239 manager can still parse as well as
+    units that use everything a current manager offers. The service, timer and
+    HSM PIN units land in --out-dir; the .socket units are written next to this
+    script in platform/systemd, because packaging lists them as static assets
+    rather than build outputs, and are skipped entirely below the
+    SocketActivation minimum.
+    """
     ap = argparse.ArgumentParser(description="Generate Himmelblau systemd unit files.")
     ap.add_argument("--out-dir", default=".", help="Output directory for generated units.")
     ap.add_argument("--assume-version", type=int, default=None,
-                    help="Assume this systemd version (skip detection).")
+                    help=f"Assume this systemd version, at least {BASELINE_VERSION} (skip detection).")
     ap.add_argument("--force-notify-reload", action="store_true",
                     help="Force Type=notify-reload regardless of detected version.")
     ap.add_argument("--disable-notify-reload", action="store_true",
@@ -98,8 +100,10 @@ def main():
     else:
         ver = detect_systemd_version()
     if ver is None:
-        # If detection failed, be conservative and assume older version 229
-        ver = 229
+        ver = BASELINE_VERSION
+        print(f"[gen-systemd] Could not detect systemd version; assuming {BASELINE_VERSION}.")
+    if ver < BASELINE_VERSION:
+        ap.error(f"systemd {BASELINE_VERSION} or newer is required (got {ver})")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -116,18 +120,12 @@ def main():
         type_line = "Type=notify-reload" if supported("TypeNotifyReload") else "Type=notify"
 
     # ---- Decide DynamicUser vs static ----
-    dyn_user_ok = supported("DynamicUser") and (args.static_user is None)
     service_user_block = []
-    if dyn_user_ok:
+    if args.static_user is None:
         service_user_block.append("DynamicUser=yes")
         service_user_block.append("User=himmelblaud")
     else:
-        # Static user
-        if not args.static_user:
-            # If not provided, fall back to root like tasks unit (safe default)
-            service_user_block.append("User=root")
-        else:
-            service_user_block.append(f"User={args.static_user}")
+        service_user_block.append(f"User={args.static_user or 'root'}")
         if args.static_group:
             service_user_block.append(f"Group={args.static_group}")
 
@@ -135,42 +133,22 @@ def main():
     if args.tss_group:
         service_user_block.append(f"SupplementaryGroups={args.tss_group}")
 
-    # ---- Directory helpers ----
-    dirs_block = []
-    if supported("CacheRuntimeStateDirs"):
-        dirs_block.extend([
-            "UMask=0027",
-            "CacheDirectory=himmelblaud",
-            "RuntimeDirectory=himmelblaud",
-            "StateDirectory=himmelblaud",
-        ])
-
     # ---- Security hardening (toggle by version) ----
-    hardening = []
-    if supported("NoNewPrivileges"):
-        hardening.append("NoNewPrivileges=true")
-    if supported("PrivateTmp"):
-        hardening.append("PrivateTmp=true")
+    hardening = ["NoNewPrivileges=true", "PrivateTmp=true"]
     # PrivateDevices: tasks wants true, daemon wants false (for TPM access)
     # We'll pass the value contextually when we compose units below.
     if supported("ProtectHostname"):
         hardening.append("ProtectHostname=true")
     if supported("ProtectClock"):
         hardening.append("ProtectClock=true")
-    if supported("ProtectKernelTunables"):
-        hardening.append("ProtectKernelTunables=true")
-    if supported("ProtectKernelModules"):
-        hardening.append("ProtectKernelModules=true")
+    hardening.extend(["ProtectKernelTunables=true", "ProtectKernelModules=true"])
     if supported("ProtectKernelLogs"):
         hardening.append("ProtectKernelLogs=true")
-    if supported("ProtectControlGroups"):
-        hardening.append("ProtectControlGroups=true")
-    if supported("MemoryDenyWriteExecute"):
-        hardening.append("MemoryDenyWriteExecute=true")
-    if supported("ProtectSystemStrict"):
-        hardening.append("ProtectSystem=strict")
-    # ReadWritePaths only if ProtectSystem=strict available
-    rw_paths_available = supported("ReadWritePaths") and supported("ProtectSystemStrict")
+    hardening.extend([
+        "ProtectControlGroups=true",
+        "MemoryDenyWriteExecute=true",
+        "ProtectSystem=strict",
+    ])
 
     # ---- Common headers ----
     # After= and Wants= lines vary slightly across distros; expose flags.
@@ -198,19 +176,34 @@ def main():
         hsm_pin_init_wants = "Wants=himmelblau-hsm-pin-init.service"
 
     # ---- Compose himmelblaud.service ----
-    daemon_private_devices = "PrivateDevices=false" if supported("PrivateDevices") else ""
-    daemon_hardening = [h for h in hardening if h != "ProtectSystem=strict"] + ["ProtectSystem=strict"] if supported("ProtectSystemStrict") else [h for h in hardening if h != "ProtectSystem=strict"]
+    socket_units = "himmelblaud.socket himmelblaud-tasks.socket himmelblaud-broker.socket"
+    if supported("SocketActivation"):
+        daemon_after_sockets = " " + socket_units
+        daemon_requires_line = "Requires=" + socket_units
+        daemon_sockets_line = "Sockets=" + socket_units
+        daemon_runtime_dir_line = ""
+    else:
+        daemon_after_sockets = ""
+        daemon_requires_line = ""
+        daemon_sockets_line = ""
+        # Without the socket units nothing else creates /run/himmelblaud for
+        # the daemon to bind in (4.0.6 had this line for the same reason).
+        daemon_runtime_dir_line = "RuntimeDirectory=himmelblaud"
 
-    daemon_rw_paths_comment = dedent("""\
-        # Implied by dynamic user.
-        # ProtectHome=
-        # ProtectSystem=strict
-        # ReadWritePaths=/var/run/himmelblaud /var/cache/himmelblaud
-    """).rstrip()
-
-    if rw_paths_available:
-        # Keep comment but we don't add ReadWritePaths for daemon by default since the daemon primarily writes those dirs via XDG helpers.
-        pass
+    fd_store_preserve = ""
+    if supported("FileDescriptorStorePreserve"):
+        if supported("PinnedFdStoreSocketActivation"):
+            fd_store_preserve = dedent("""\
+                # systemd 257+ can reactivate sockets while this service is stopped
+                # with resources pinned, so retain broker tokens across stop/start.
+                FileDescriptorStorePreserve=yes
+            """).rstrip()
+        else:
+            fd_store_preserve = dedent("""\
+                # systemd 254-256 cannot reactivate sockets while this service is
+                # pinned, so retain broker tokens across atomic restarts only.
+                FileDescriptorStorePreserve=restart
+            """).rstrip()
 
     daemon_unit = f"""\
 # You should not need to edit this file. Instead, use a drop-in file:
@@ -218,7 +211,8 @@ def main():
 
 [Unit]
 Description=Himmelblau Authentication Daemon
-After={' '.join(base_after)}{' ' + hsm_pin_init_after if hsm_pin_init_after else ''}
+After={' '.join(base_after)}{' ' + hsm_pin_init_after if hsm_pin_init_after else ''}{daemon_after_sockets}
+{daemon_requires_line}
 Before={' '.join(base_before)}
 Wants={' '.join(base_wants)}
 {hsm_pin_init_wants}
@@ -229,43 +223,59 @@ Conflicts=nscd.service
 # ensures it's kept running. This allows for a repeatable & fast way of starting
 # himmelblaud-tasks at the right time.
 {upholds_line if upholds_line else ''}
-{'StartLimitIntervalSec=30s' if supported('StartLimitIntervalSec') else ''}
-{'StartLimitBurst=8' if supported('StartLimitBurst') else ''}
+StartLimitIntervalSec=30s
+StartLimitBurst=8
 
 [Service]
 {os.linesep.join(service_user_block)}
-{os.linesep.join(dirs_block)}
+UMask=0027
+CacheDirectory=himmelblaud
+StateDirectory=himmelblaud
+ConfigurationDirectory=himmelblau
+{daemon_runtime_dir_line}
 
 {type_line}
 {'LoadCredentialEncrypted=hsm-pin:/var/lib/himmelblaud/hsm-pin-nopcr.enc' if supported('LoadCredentialEncrypted') else ''}
 {'Environment=HIMMELBLAU_HSM_PIN_PATH=%d/hsm-pin' if supported('LoadCredentialEncrypted') else ''}
 ExecStart=/usr/sbin/himmelblaud
+{daemon_sockets_line}
 Restart=on-failure
 RestartSec=500ms
 WatchdogSec=120s
-{'FileDescriptorStoreMax=1' if supported('FileDescriptorStoreMax') else ''}
-{'FileDescriptorStorePreserve=yes' if supported('FileDescriptorStorePreserve') else ''}
+FileDescriptorStoreMax=1
+{fd_store_preserve}
 
-{daemon_rw_paths_comment}
+# Implied by dynamic user.
+# ProtectHome=
+# ProtectSystem=strict
+# ReadWritePaths=/var/run/himmelblaud /var/cache/himmelblaud
 
 # SystemCallFilter=@aio @basic-io @chown @file-system @io-event @network-io @sync
-{os.linesep.join(daemon_hardening)}
+{os.linesep.join(hardening)}
 PrivateTmp=true
 # We have to disable this to allow tpmrm0 access for tpm binding.
-{daemon_private_devices}
+PrivateDevices=false
 
 [Install]
 WantedBy=multi-user.target
 """.rstrip() + "\n"
 
     # ---- Compose himmelblaud-tasks.service ----
-    tasks_hardening = list(hardening)  # copy
-    # tasks requires PrivateDevices=true
-    tasks_private_devices = "PrivateDevices=true" if supported("PrivateDevices") else ""
-    # ReadWritePaths needed for tasks
-    rw_paths = "/home /run/himmelblaud /tmp /etc/krb5.conf.d /etc /var/lib /var/cache/nss-himmelblau /var/cache/himmelblau-policies"
-    rw_line = f"ReadWritePaths={rw_paths}" if rw_paths_available else ""
-
+    # Intune CustomCompliance discovery scripts commonly shell out to `mokutil`
+    # (Microsoft's stock Secure Boot compliance script runs `mokutil --db`).
+    #
+    # mokutil's mok_get_variable() reads /sys/firmware/efi/mok-variables/<name>
+    # first and only falls back to efivarfs if that open() fails. Those files are
+    # mode 0400 root:root, so this unit (User=root) opens them successfully - but
+    # the kernel's efi_mokvar_sysfs_read() returns 0 rather than -EPERM when the
+    # reader lacks CAP_SYS_ADMIN, which our CapabilityBoundingSet drops. mokutil's
+    # read loop has no ssz==0 guard, so it spins at 100% CPU forever, blocks the
+    # task daemon's watchdog pings, and WatchdogSec SIGABRTs the whole service.
+    #
+    # Hiding the directory makes that open() fail so mokutil takes its normal
+    # efivarfs fallback - the same path unprivileged callers already use. This is
+    # preferable to granting CAP_SYS_ADMIN, and does not affect `mokutil
+    # --sb-state`, which uses efi_get_variable() and never touches mok-variables.
     tasks_unit = f"""\
 # You should not need to edit this file. Instead, use a drop-in file:
 #   systemctl edit himmelblaud-tasks.service
@@ -279,9 +289,9 @@ Requires=himmelblaud.service
 # has created the socket necessary for communication.
 # We need the check so that fs namespacing used by `ReadWritePaths` has a
 # strict enough target to namespace. Without the check it fails in a more confusing way.
-{'ConditionPathExists=/run/himmelblaud/task_sock' if supported('ConditionPathExists') else ''}
-{'StartLimitIntervalSec=30s' if supported('StartLimitIntervalSec') else ''}
-{'StartLimitBurst=8' if supported('StartLimitBurst') else ''}
+ConditionPathExists=/run/himmelblaud/task_sock
+StartLimitIntervalSec=30s
+StartLimitBurst=8
 
 [Service]
 User=root
@@ -292,13 +302,15 @@ RestartSec=1s
 WatchdogSec=120s
 
 CacheDirectory=nss-himmelblau
+ConfigurationDirectory=himmelblau
 CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
 AmbientCapabilities=CAP_SETUID CAP_SETGID
 # SystemCallFilter=@aio @basic-io @chown @file-system @io-event @network-io @sync
-{ 'ProtectSystem=strict' if supported('ProtectSystemStrict') else '' }
-{rw_line}
-{os.linesep.join([h for h in tasks_hardening if not h.startswith('ProtectSystem=')])}
-{tasks_private_devices}
+ProtectSystem=strict
+ReadWritePaths=/home /run/himmelblaud /tmp /etc/krb5.conf.d /etc /var/lib /var/cache/nss-himmelblau /var/cache/himmelblau-policies
+{os.linesep.join([h for h in hardening if not h.startswith('ProtectSystem=')])}
+PrivateDevices=true
+InaccessiblePaths=-/sys/firmware/efi/mok-variables
 
 [Install]
 WantedBy=multi-user.target
@@ -321,11 +333,17 @@ DefaultDependencies=no
 # Wants= (not Requires=) so we degrade gracefully on TPM-less systems.
 After=local-fs.target systemd-tpm2-setup.service
 Wants=systemd-tpm2-setup.service
-ConditionPathExists=!/var/lib/private/himmelblaud/hsm-pin-nopcr.enc
 
 [Service]
 Type=oneshot
+StateDirectory=himmelblaud
+StateDirectoryMode=0700
+BindPaths=/run/systemd /var/lib/systemd
 ExecStart=/usr/libexec/himmelblau-init-hsm-pin
+RuntimeDirectory=himmelblau-hsm-pin
+RuntimeDirectoryMode=0700
+TemporaryFileSystem=/run/himmelblau-hsm-pin:rw,mode=0700
+UMask=0077
 
 [Install]
 WantedBy=himmelblaud.service
@@ -342,12 +360,6 @@ WantedBy=himmelblaud.service
         and h != "ProtectHostname=true"
         and h != "MemoryDenyWriteExecute=true"
     ]
-    orchestrator_private_devices = "PrivateDevices=false" if supported("PrivateDevices") else ""
-    orchestrator_rw_line = (
-        "ReadWritePaths=/run/himmelblaud /run/lock /run/netns -/run/containers -/var/lib/containers -/run/libpod -/run/crun -/run/runc -/etc/containers/networks -/var/cache/himmelblaud/orchestrator -/var/cache/private/himmelblaud/orchestrator"
-        if rw_paths_available
-        else ""
-    )
     orchestrator_apparmor_line = (
         f"Environment=HIMMELBLAU_ORCHESTRATOR_APPARMOR_PROFILE={args.orchestrator_apparmor_profile.strip()}"
         if args.orchestrator_apparmor_profile.strip()
@@ -378,10 +390,10 @@ RestartPreventExitStatus=75
 RestartSec=1s
 KillMode=mixed
 TimeoutStopSec=10s
-{ 'ProtectSystem=strict' if supported('ProtectSystemStrict') else '' }
-{orchestrator_rw_line}
+ProtectSystem=strict
+ReadWritePaths=/run/himmelblaud /run/lock /run/netns -/run/containers -/var/lib/containers -/run/libpod -/run/crun -/run/runc -/etc/containers/networks -/var/cache/himmelblaud/orchestrator -/var/cache/private/himmelblaud/orchestrator
 {os.linesep.join(orchestrator_hardening)}
-{orchestrator_private_devices}
+PrivateDevices=false
 
 [Install]
 WantedBy=multi-user.target
@@ -433,6 +445,58 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 """
+
+    socket_after = " ".join(
+        s for s in base_after + ([hsm_pin_init_after] if hsm_pin_init_after else []) + ["sockets.target"] if s
+    )
+    socket_header = (
+        "DefaultDependencies=no\n"
+        "# Started by himmelblaud.service, not sockets.target. Early listening left\n"
+        "# NSS clients connected to a socket nobody accepted and hung boot (#1345).\n"
+        f"After={socket_after}\n"
+        "Before=himmelblaud.service\n"
+        "PartOf=himmelblaud.service\n"
+    )
+
+    # Debian and openSUSE socket units are the same. Write them once.
+    socket_dir = Path(__file__).resolve().parent.parent / "platform" / "systemd"
+
+    def write_socket(name: str, desc: str, listen: str, fdname: str, extra: str = "") -> None:
+        (socket_dir / name).write_text(
+            f"# You should not need to edit this file. Instead, use a drop-in file:\n"
+            f"#   systemctl edit {name}\n\n"
+            f"[Unit]\nDescription={desc}\n{socket_header}\n"
+            f"[Socket]\nListenStream={listen}\nFileDescriptorName={fdname}\n"
+            f"{extra}DirectoryMode=0755\nAccept=false\nService=himmelblaud.service\n"
+        )
+        print(f"[gen-systemd] Wrote: {socket_dir / name}")
+
+    if supported("SocketActivation"):
+        socket_dir.mkdir(parents=True, exist_ok=True)
+        write_socket(
+            "himmelblaud.socket",
+            "Himmelblau Authentication Daemon Socket",
+            "/run/himmelblaud/socket",
+            "himmelblaud",
+            extra="SocketMode=0666\n",
+        )
+        write_socket(
+            "himmelblaud-tasks.socket",
+            "Himmelblau Daemon Task Socket",
+            "/run/himmelblaud/task_sock",
+            "himmelblaud-task",
+            extra="SocketMode=0600\nSocketUser=root\nSocketGroup=root\n",
+        )
+        write_socket(
+            "himmelblaud-broker.socket",
+            "Himmelblau Daemon Broker Socket",
+            "/run/himmelblaud/broker_sock",
+            "himmelblaud-broker",
+            extra="SocketMode=0666\n",
+        )
+    else:
+        print(f"[gen-systemd] systemd {ver} predates $SYSTEMD_ACTIVATION_UNIT "
+              "(240); skipping socket units, himmelblaud will bind its own.")
 
     (out_dir / "himmelblaud.service").write_text(daemon_unit)
     (out_dir / "himmelblaud-tasks.service").write_text(tasks_unit)

@@ -18,6 +18,7 @@
 #![deny(clippy::await_holding_lock)]
 #![deny(clippy::needless_pass_by_value)]
 #![deny(clippy::trivially_copy_pass_by_ref)]
+#![recursion_limit = "256"]
 
 #[cfg(target_family = "unix")]
 #[macro_use]
@@ -43,6 +44,8 @@ pub mod client_sync;
 #[cfg(target_family = "unix")]
 pub mod db;
 #[cfg(target_family = "unix")]
+mod enrollment;
+#[cfg(target_family = "unix")]
 pub mod hello_pin_complexity;
 #[cfg(target_family = "unix")]
 pub mod i18n;
@@ -59,6 +62,8 @@ pub mod pam;
 #[cfg(target_family = "unix")]
 pub mod policy_cache;
 #[cfg(target_family = "unix")]
+pub mod reserved_ids;
+#[cfg(target_family = "unix")]
 pub mod resolver;
 #[cfg(target_family = "unix")]
 pub mod tpm;
@@ -68,3 +73,5 @@ pub mod unix_passwd;
 pub mod unix_proto;
 #[cfg(target_family = "unix")]
 pub mod user_map;
+#[cfg(target_family = "unix")]
+mod webauthn;
