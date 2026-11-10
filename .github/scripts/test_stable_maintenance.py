@@ -5121,6 +5121,7 @@ class CheckpointMaintenanceTests(unittest.TestCase):
                 self.assertIn(f"needs.{previous}.outputs.{field}", block)
         self.assertEqual(branch.count("uses: ./.github/workflows/stable-maintenance-stage.yml"), 7)
         self.assertIn("MAINTENANCE_TOOLING_COMMIT: ${{ github.sha }}", stage)
+        self.assertIn("if: ${{ inputs.stage == 'dependencies' }}", stage)
         self.assertIn("run: env -u MAINTENANCE_TOOLING_COMMIT python3 tooling/.github/scripts/test_stable_maintenance.py", stage)
         self.assertNotIn("workflow_run:", stage + branch + WORKFLOW.read_text())
         self.assertNotIn("continue-on-error:", stage + branch)
