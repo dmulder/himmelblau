@@ -51,7 +51,10 @@ use himmelblau_unix_common::constants::{
 use himmelblau_unix_common::db::{Cache, CacheTxn, Db, KeyStoreTxn};
 use himmelblau_unix_common::idmap_cache::{StaticGroup, StaticIdCache, StaticUser};
 use himmelblau_unix_common::pam::{Options, PamResultCode};
-use himmelblau_unix_common::tpm::{confidential_client_creds, open_tpm};
+use himmelblau_unix_common::reserved_ids::{
+    is_systemd_dynamic_id, SYSTEMD_DYNAMIC_ID_MAX, SYSTEMD_DYNAMIC_ID_MIN,
+};
+use himmelblau_unix_common::tpm::{confidential_client_creds, open_tpm, resolve_hsm_type};
 use himmelblau_unix_common::tpm_init;
 use himmelblau_unix_common::unix_config::HsmType;
 use himmelblau_unix_common::unix_proto::{ClientRequest, ClientResponse};
@@ -65,8 +68,7 @@ use kanidm_hsm_crypto::glue::{
 };
 use kanidm_hsm_crypto::structures::{LoadableRS256Key, SealedData};
 use kanidm_hsm_crypto::{
-    provider::BoxedDynTpm, provider::SoftTpm, provider::Tpm,
-    structures::LoadableMsDeviceEnrolmentKey, structures::LoadableMsOapxbcRsaKey,
+    provider::Tpm, structures::LoadableMsDeviceEnrolmentKey, structures::LoadableMsOapxbcRsaKey,
 };
 use rpassword::read_password;
 use serde::Deserialize;
@@ -105,12 +107,43 @@ struct Token {
     response: BrokerTokenResponse,
 }
 
+fn preserve_numeric_account_success(existing_line: &str) -> Option<String> {
+    let control_start = existing_line.find('[')?;
+    let control_end = existing_line[control_start..].find(']')? + control_start;
+    let control = &existing_line[control_start + 1..control_end];
+    let actions: Vec<&str> = control.split_whitespace().collect();
+    let has_numeric_success = actions.iter().any(|action| {
+        action.strip_prefix("success=").is_some_and(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    });
+    if !has_numeric_success || !actions.contains(&"default=ignore") {
+        return None;
+    }
+
+    if actions.contains(&"auth_err=die") {
+        return Some(existing_line.to_string());
+    }
+    if actions.iter().any(|action| action.starts_with("auth_err=")) {
+        return None;
+    }
+
+    let default_offset = control.find("default=ignore")?;
+    let insert_at = control_start + 1 + default_offset;
+    Some(format!(
+        "{}auth_err=die {}",
+        &existing_line[..insert_at],
+        &existing_line[insert_at..]
+    ))
+}
+
 #[instrument(skip(after_pred, before_pred))]
 fn insert_module_line(
     pam_file: &str,
     module_line: &str,
     after_pred: Option<&dyn Fn(&str) -> bool>,
     before_pred: Option<&dyn Fn(&str) -> bool>,
+    replace_same_options: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let original = std::fs::read_to_string(pam_file)?;
@@ -124,8 +157,9 @@ fn insert_module_line(
         .split_whitespace()
         .collect();
     let stack_type = module_line.split_whitespace().next().unwrap_or("");
+    let normalized_module_line = module_line.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    if lines.iter().any(|l| {
+    if let Some(existing_index) = lines.iter().position(|l| {
         if !l.contains("pam_himmelblau.so") || !l.trim_start().starts_with(stack_type) {
             return false;
         }
@@ -137,7 +171,35 @@ fn insert_module_line(
             .collect();
         existing_opts == desired_opts
     }) {
-        debug!("{} already contains pam_himmelblau; skipping", pam_file);
+        if !replace_same_options
+            || lines[existing_index]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                == normalized_module_line
+        {
+            debug!("{} already contains pam_himmelblau; skipping", pam_file);
+            return Ok(());
+        }
+
+        let updated_line = preserve_numeric_account_success(&lines[existing_index])
+            .unwrap_or_else(|| module_line.to_string());
+        if updated_line == lines[existing_index] {
+            debug!("{} already contains pam_himmelblau; skipping", pam_file);
+            return Ok(());
+        }
+        lines[existing_index] = updated_line;
+
+        if dry_run {
+            println!("[{}] (dry run):", pam_file);
+            for line in &lines {
+                println!("{}", line);
+            }
+        } else {
+            std::fs::write(pam_file, lines.join("\n") + "\n")?;
+            info!("Modified {}", pam_file);
+        }
+
         return Ok(());
     }
 
@@ -275,6 +337,7 @@ fn configure_pam(
                 "auth\toptional\tpam_himmelblau.so try_unseal",
                 None,
                 None,
+                false,
                 dry_run,
             )?;
         } else {
@@ -286,6 +349,7 @@ fn configure_pam(
                 None,
                 // pam_himmelblau should always come first on the auth stack
                 Some(&|_: &str| true),
+                false,
                 dry_run,
             )?;
         }
@@ -299,12 +363,13 @@ fn configure_pam(
     for account_file in &account_files {
         insert_module_line(
             account_file,
-            "account\tsufficient\tpam_himmelblau.so ignore_unknown_user",
+            "account\t[success=ok auth_err=die default=ignore]\tpam_himmelblau.so ignore_unknown_user",
             None,
             Some(&|l: &str| {
                 (l.contains("pam_unix.so") && l.contains("account"))
                     || (l.contains("pam_faillock.so") && l.contains("account"))
             }),
+            true,
             dry_run,
         )?;
     }
@@ -316,6 +381,7 @@ fn configure_pam(
             "session\toptional\tpam_himmelblau.so",
             None,
             None,
+            false,
             dry_run,
         )?;
     }
@@ -331,6 +397,7 @@ fn configure_pam(
                     || (l.contains("pam_cracklib.so") && l.contains("password"))
                     || (l.contains("pam_pwquality.so") && l.contains("password"))
             }),
+            false,
             dry_run,
         )?;
     }
@@ -351,11 +418,17 @@ async fn auth(app: &BrokerClientApplication, account_id: &str) -> Option<UserTok
         .as_ref()
         .map(|c| c.get_enable_passwordless())
         .unwrap_or(true);
-    let auth_options = if enable_passwordless {
-        vec![AuthOption::Passwordless]
-    } else {
-        vec![]
-    };
+    let use_intune_auth_resource = config
+        .as_ref()
+        .map(|c| c.get_use_intune_auth_resource())
+        .unwrap_or(false);
+    let mut auth_options = vec![];
+    if enable_passwordless {
+        auth_options.push(AuthOption::Passwordless);
+    }
+    if use_intune_auth_resource {
+        auth_options.push(AuthOption::IntuneEnable);
+    }
     let auth_init = match app.check_user_exists(account_id, &auth_options).await {
         Ok(auth_init) => auth_init,
         Err(e) => {
@@ -374,7 +447,7 @@ async fn auth(app: &BrokerClientApplication, account_id: &str) -> Option<UserTok
     debug!("User {} exists? {}", &account_id, exists);
 
     let password = if !auth_init.passwordless() {
-        print!("{} password: ", &account_id);
+        print!("{} password: ", account_id);
         if io::stdout().flush().is_err() {
             error!("Failed flushing stdout");
             return None;
@@ -405,7 +478,7 @@ async fn auth(app: &BrokerClientApplication, account_id: &str) -> Option<UserTok
         Ok(mfa) => mfa,
         Err(e) => match e {
             MsalError::PasswordRequired => {
-                print!("{} password: ", &account_id);
+                print!("{} password: ", account_id);
                 if io::stdout().flush().is_err() {
                     error!("Failed flushing stdout");
                     return None;
@@ -537,13 +610,14 @@ async fn confidential_client_access_token(
         }
     } else if let Some(domain) = domain {
         domain
-    } else {
+    } else if let Some(domain) = cfg.get_configured_entra_domain() {
         // Attempt using the default domain
         debug!(?domain, "Using default domain");
-        cfg.get_configured_domains()[0].clone()
+        domain
+    } else {
+        error!("No domain is configured");
+        return None;
     };
-
-    let (auth_value, mut tpm) = tpm_init!(cfg, return None);
 
     let db = match Db::new(&cfg.get_db_path()) {
         Ok(db) => db,
@@ -552,6 +626,8 @@ async fn confidential_client_access_token(
             return None;
         }
     };
+
+    let (auth_value, mut tpm) = tpm_init!(cfg, db.get_loadable_hsm_key(), return None);
 
     // Fetch the machine key
     let loadable_machine_key = tpm_loadable_machine_key!(db, tpm, auth_value, false, return None);
@@ -779,8 +855,6 @@ async fn main() -> ExitCode {
 
     macro_rules! obtain_host_data {
         ($domain:expr, $cfg:ident) => {{
-            let (auth_value, mut tpm) = tpm_init!($cfg, return ExitCode::FAILURE);
-
             let db = match Db::new(&$cfg.get_db_path()) {
                 Ok(db) => db,
                 Err(e) => {
@@ -788,6 +862,9 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            let (auth_value, mut tpm) =
+                tpm_init!($cfg, db.get_loadable_hsm_key(), return ExitCode::FAILURE);
 
             // Fetch the machine key
             let loadable_machine_key = tpm_loadable_machine_key!(
@@ -942,7 +1019,8 @@ async fn main() -> ExitCode {
                                     if let Ok(Account { username, .. }) = serde_json::from_value::<Account>(account.clone()) {
                                         if $account_id.is_none() || $account_id.clone().map(|s| s.to_lowercase()).as_ref().unwrap_or(&"".to_string()) == &username.to_lowercase() {
                                             if let Ok(cfg) = HimmelblauConfig::new(Some(DEFAULT_CONFIG_PATH)) {
-                                                let (graph, _, authority) = init!(cfg, Some(username), None);
+                                                let (graph, domain, authority) = init!(cfg, Some(username), None);
+                                                let sso_url = format!("https://{}/", cfg.get_authority_host(&domain));
                                                 if let Ok(token_val) = broker.acquire_token_silently(
                                                     "0.0", &session_id,
                                                     &json!({
@@ -955,7 +1033,7 @@ async fn main() -> ExitCode {
                                                             "clientId": client_id,
                                                             "redirectUri": "https://login.microsoftonline.com/common/oauth2/nativeclient",
                                                             "requestedScopes": $scopes,
-                                                            "ssoUrl": "https://login.microsoftonline.com/"
+                                                            "ssoUrl": sso_url
                                                         }
                                                     })
                                                 ).await {
@@ -1045,8 +1123,6 @@ async fn main() -> ExitCode {
                 }
             };
 
-            let (auth_value, mut tpm) = tpm_init!(cfg, return ExitCode::FAILURE);
-
             let db = match Db::new(&cfg.get_db_path()) {
                 Ok(db) => db,
                 Err(e) => {
@@ -1054,6 +1130,9 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            let (auth_value, mut tpm) =
+                tpm_init!(cfg, db.get_loadable_hsm_key(), return ExitCode::FAILURE);
 
             // Fetch the machine key
             let loadable_machine_key =
@@ -1247,8 +1326,6 @@ async fn main() -> ExitCode {
                 }
             };
 
-            let (auth_value, mut tpm) = tpm_init!(cfg, return ExitCode::FAILURE);
-
             let db = match Db::new(&cfg.get_db_path()) {
                 Ok(db) => db,
                 Err(e) => {
@@ -1256,6 +1333,9 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            let (auth_value, mut tpm) =
+                tpm_init!(cfg, db.get_loadable_hsm_key(), return ExitCode::FAILURE);
 
             // Fetch the machine key
             let loadable_machine_key =
@@ -1865,6 +1945,15 @@ async fn main() -> ExitCode {
             for user in users {
                 if let Some(uid) = user.uid {
                     let gid = user.gid.unwrap_or(uid);
+                    // Never cache a directory identity into systemd's dynamic
+                    // user range. See GHSA-6gp8-pp9v-gx45.
+                    if is_systemd_dynamic_id(uid) || is_systemd_dynamic_id(gid) {
+                        warn!(
+                            "Skipping user {} (uid {}, gid {}): {}-{} is reserved for systemd dynamic users",
+                            user.upn, uid, gid, SYSTEMD_DYNAMIC_ID_MIN, SYSTEMD_DYNAMIC_ID_MAX
+                        );
+                        continue;
+                    }
                     let cache_user = StaticUser {
                         name: user.upn.clone(),
                         uid,
@@ -1883,6 +1972,15 @@ async fn main() -> ExitCode {
 
             for group in groups {
                 if let Some(gid) = group.gid {
+                    // Never cache a directory group into systemd's dynamic
+                    // user range. See GHSA-6gp8-pp9v-gx45.
+                    if is_systemd_dynamic_id(gid) {
+                        warn!(
+                            "Skipping group {} (gid {}): {}-{} is reserved for systemd dynamic users",
+                            group.displayname, gid, SYSTEMD_DYNAMIC_ID_MIN, SYSTEMD_DYNAMIC_ID_MAX
+                        );
+                        continue;
+                    }
                     let cache_group = StaticGroup {
                         name: group.displayname.clone(),
                         gid,
@@ -1914,6 +2012,20 @@ async fn main() -> ExitCode {
             gecos,
         }) => {
             debug!("Starting user set posix attrs tool ...");
+
+            // Refuse to publish an identity into systemd's dynamic user range.
+            // See GHSA-6gp8-pp9v-gx45.
+            for (attr, val) in [("uidNumber", uid), ("gidNumber", gid)] {
+                if let Some(val) = val {
+                    if is_systemd_dynamic_id(val) {
+                        error!(
+                            "Refusing to set {} to {}: {}-{} is reserved for systemd dynamic users",
+                            attr, val, SYSTEMD_DYNAMIC_ID_MIN, SYSTEMD_DYNAMIC_ID_MAX
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
 
             let (graph, access_token) = match obtain_access_token!(
                 account_id,
@@ -1966,6 +2078,16 @@ async fn main() -> ExitCode {
         }) => {
             debug!("Starting group set posix attrs tool ...");
 
+            // Refuse to publish a group into systemd's dynamic user range.
+            // See GHSA-6gp8-pp9v-gx45.
+            if is_systemd_dynamic_id(gid) {
+                error!(
+                    "Refusing to set gidNumber to {}: {}-{} is reserved for systemd dynamic users",
+                    gid, SYSTEMD_DYNAMIC_ID_MIN, SYSTEMD_DYNAMIC_ID_MAX
+                );
+                return ExitCode::FAILURE;
+            }
+
             let (graph, access_token) = match obtain_access_token!(
                 account_id,
                 vec!["https://graph.microsoft.com/Group.ReadWrite.All"],
@@ -2014,6 +2136,16 @@ async fn main() -> ExitCode {
                 } => {
                     trace!("Configuring id user mapping ...");
 
+                    // Never map an account into systemd's dynamic user range.
+                    // See GHSA-6gp8-pp9v-gx45.
+                    if is_systemd_dynamic_id(uid) || is_systemd_dynamic_id(gid) {
+                        error!(
+                            "Refusing to map {} to uid {}, gid {}: {}-{} is reserved for systemd dynamic users",
+                            account_id, uid, gid, SYSTEMD_DYNAMIC_ID_MIN, SYSTEMD_DYNAMIC_ID_MAX
+                        );
+                        return ExitCode::FAILURE;
+                    }
+
                     let cache = match StaticIdCache::new(ID_MAP_CACHE, true) {
                         Ok(cache) => cache,
                         Err(e) => {
@@ -2042,6 +2174,16 @@ async fn main() -> ExitCode {
                     gid,
                 } => {
                     trace!("Configuring id group mapping ...");
+
+                    // Never map a group into systemd's dynamic user range.
+                    // See GHSA-6gp8-pp9v-gx45.
+                    if is_systemd_dynamic_id(gid) {
+                        error!(
+                            "Refusing to map {} to gid {}: {}-{} is reserved for systemd dynamic users",
+                            object_id, gid, SYSTEMD_DYNAMIC_ID_MIN, SYSTEMD_DYNAMIC_ID_MAX
+                        );
+                        return ExitCode::FAILURE;
+                    }
 
                     let cache = match StaticIdCache::new(ID_MAP_CACHE, true) {
                         Ok(cache) => cache,
@@ -2195,6 +2337,25 @@ async fn main() -> ExitCode {
                 }
             };
 
+            let existing_machine_key = match Db::open_read_only(&cfg.get_db_path()) {
+                Ok(Some(db)) => match db.get_loadable_hsm_key().await {
+                    Ok(machine_key) => machine_key,
+                    Err(e) => {
+                        error!("Failed loading HSM machine key: {:?}", e);
+                        return ExitCode::FAILURE;
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    error!("Failed loading Himmelblau cache: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let configured_hsm_type = cfg.get_hsm_type();
+            let effective_hsm_type =
+                resolve_hsm_type(&configured_hsm_type, existing_machine_key.as_ref());
+            let soft_fallback_available = effective_hsm_type == HsmType::TpmIfPossible;
+
             // Check whether the HSM PIN credential is TPM-bound via systemd-creds.
             // This is reliable evidence of TPM involvement regardless of hsm_type.
             let unencrypted_pin_present = match PathBuf::from_str(&cfg.get_hsm_pin_path()) {
@@ -2207,16 +2368,12 @@ async fn main() -> ExitCode {
             };
             let pin_tpm_bound = encrypted_pin_present && !unencrypted_pin_present;
 
-            // Actually attempt to open the hardware TPM to verify it is reachable
-            // and the compiled binary has the tpm feature enabled. Reading the
-            // config string alone is not sufficient — it may say "tpm" while the
-            // daemon silently fell back to SoftTpm (e.g. after a Soft→TPM migration
-            // without clearing HSM key material, or on a system where the SRK has
-            // not been provisioned).
-            let hw_tpm_opened = open_tpm(&cfg.get_tpm_tcti_name()).is_some();
-
-            match cfg.get_hsm_type() {
+            match effective_hsm_type {
                 HsmType::Tpm | HsmType::TpmIfPossible => {
+                    // Actually attempt to open the hardware TPM to verify it is reachable
+                    // and the compiled binary has the tpm feature enabled.
+                    let hw_tpm_opened = open_tpm(&cfg.get_tpm_tcti_name()).is_some();
+
                     if hw_tpm_opened {
                         if pin_tpm_bound {
                             println!(
@@ -2239,16 +2396,36 @@ async fn main() -> ExitCode {
                         );
                         println!(
                             "  hsm_type = {} in config, but opening the TPM device failed.",
-                            cfg.get_hsm_type()
+                            configured_hsm_type
                         );
-                        println!(
-                            "  The daemon may be running in SoftTpm fallback mode. \
-                             Check that the tpm feature was compiled in and /dev/tpmrm0 is accessible."
-                        );
+                        if soft_fallback_available {
+                            println!(
+                                "  The daemon may be running in SoftTpm fallback mode. \
+                                 Check that the tpm feature was compiled in and /dev/tpmrm0 is accessible."
+                            );
+                        } else if configured_hsm_type == HsmType::TpmIfPossible {
+                            println!(
+                                "  The persisted TPM-backed machine key prevents SoftTpm fallback. \
+                                 The daemon cannot start until the TPM is reachable."
+                            );
+                        } else {
+                            println!("  The daemon cannot start until the TPM is reachable.");
+                        }
                     }
                 }
                 HsmType::Soft => {
-                    if pin_tpm_bound {
+                    let tpm_available = configured_hsm_type == HsmType::TpmIfPossible
+                        && open_tpm(&cfg.get_tpm_tcti_name()).is_some();
+
+                    if tpm_available {
+                        println!(
+                            "Himmelblau TPM state: \x1b[33mTPM available but not in use\x1b[0m \
+                             (existing software machine key selects the Soft HSM)"
+                        );
+                        if pin_tpm_bound {
+                            println!("  HSM PIN is TPM-bound via systemd-creds.");
+                        }
+                    } else if pin_tpm_bound {
                         println!(
                             "Himmelblau TPM state: \x1b[33mSoft HSM, but HSM PIN is TPM-bound \
                              via systemd-creds\x1b[0m"
@@ -2333,5 +2510,336 @@ async fn main() -> ExitCode {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HimmelblauUnixParser;
+    use super::{insert_module_line, preserve_numeric_account_success};
+    use clap::CommandFactory;
+    use himmelblau_unix_common::db::{Cache, CacheTxn, Db};
+    use himmelblau_unix_common::tpm::resolve_hsm_type;
+    use himmelblau_unix_common::unix_config::HsmType;
+    use kanidm_hsm_crypto::provider::{BoxedDynTpm, SoftTpm, Tpm};
+    use kanidm_hsm_crypto::AuthValue;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const ACCOUNT_LINE: &str =
+        "account\t[success=ok auth_err=die default=ignore]\tpam_himmelblau.so ignore_unknown_user";
+
+    fn temp_pam_file(name: &str, content: &str) -> anyhow::Result<PathBuf> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aad-tool-{}-{}-{}.pam",
+            name,
+            std::process::id(),
+            nanos
+        ));
+        fs::write(&path, content)?;
+        Ok(path)
+    }
+
+    fn read_to_string(path: &PathBuf) -> anyhow::Result<String> {
+        Ok(fs::read_to_string(path)?)
+    }
+
+    fn remove_temp_file(path: &PathBuf) -> anyhow::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn tpm_status_uses_persisted_soft_machine_key() -> anyhow::Result<()> {
+        let db = Db::new("").map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(
+            resolve_hsm_type(
+                &HsmType::TpmIfPossible,
+                db.get_loadable_hsm_key()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                    .as_ref(),
+            ),
+            HsmType::TpmIfPossible
+        );
+
+        let hsm_pin = AuthValue::generate().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let auth_value =
+            AuthValue::try_from(hsm_pin.as_bytes()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mut hsm = BoxedDynTpm::new(SoftTpm::new());
+        let loadable_machine_key = hsm
+            .root_storage_key_create(&auth_value)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mut dbtxn = db.write().await;
+        dbtxn.migrate().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        dbtxn
+            .insert_hsm_machine_key(&loadable_machine_key)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        dbtxn.commit().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+        let existing_machine_key = db
+            .get_loadable_hsm_key()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(
+            resolve_hsm_type(&HsmType::TpmIfPossible, existing_machine_key.as_ref()),
+            HsmType::Soft
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tpm_status_does_not_create_missing_cache() -> anyhow::Result<()> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aad-tool-tpm-status-missing-cache-{}-{}.db",
+            std::process::id(),
+            nanos
+        ));
+        assert!(!path.exists());
+
+        let db = Db::open_read_only(path.to_str().unwrap_or_default())
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert!(db.is_none());
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn replaces_legacy_sufficient_account_line() -> anyhow::Result<()> {
+        let path = temp_pam_file(
+            "legacy-sufficient",
+            "account sufficient pam_himmelblau.so ignore_unknown_user\naccount required pam_unix.so\n",
+        )?;
+
+        insert_module_line(
+            path.to_str().unwrap_or_default(),
+            ACCOUNT_LINE,
+            None,
+            None,
+            true,
+            false,
+        )?;
+
+        let content = read_to_string(&path)?;
+        assert_eq!(
+            content,
+            format!("{}\naccount required pam_unix.so\n", ACCOUNT_LINE)
+        );
+        remove_temp_file(&path)
+    }
+
+    #[test]
+    fn replaces_legacy_required_account_line() -> anyhow::Result<()> {
+        let path = temp_pam_file(
+            "legacy-required",
+            "account required pam_himmelblau.so ignore_unknown_user\naccount required pam_unix.so\n",
+        )?;
+
+        insert_module_line(
+            path.to_str().unwrap_or_default(),
+            ACCOUNT_LINE,
+            None,
+            None,
+            true,
+            false,
+        )?;
+
+        let content = read_to_string(&path)?;
+        assert_eq!(
+            content,
+            format!("{}\naccount required pam_unix.so\n", ACCOUNT_LINE)
+        );
+        remove_temp_file(&path)
+    }
+
+    #[test]
+    fn skips_already_correct_account_line() -> anyhow::Result<()> {
+        let existing = concat!(
+            "account   [success=ok auth_err=die default=ignore]   ",
+            "pam_himmelblau.so   ignore_unknown_user\n",
+            "account required pam_unix.so\n"
+        );
+        let path = temp_pam_file("already-correct", existing)?;
+
+        insert_module_line(
+            path.to_str().unwrap_or_default(),
+            ACCOUNT_LINE,
+            None,
+            None,
+            true,
+            false,
+        )?;
+
+        let content = read_to_string(&path)?;
+        assert_eq!(content, existing);
+        remove_temp_file(&path)
+    }
+
+    #[test]
+    fn preserves_secure_pam_auth_update_jump() {
+        let line = "account [success=2 auth_err=die default=ignore] pam_himmelblau.so";
+        assert_eq!(
+            preserve_numeric_account_success(line).as_deref(),
+            Some(line)
+        );
+    }
+
+    #[test]
+    fn skips_secure_numeric_account_jump_without_rewriting() -> anyhow::Result<()> {
+        let existing = concat!(
+            "account [success=2 auth_err=die default=ignore] ",
+            "pam_himmelblau.so ignore_unknown_user\n",
+            "account required pam_unix.so\n"
+        );
+        let path = temp_pam_file("secure-numeric-account-jump", existing)?;
+        let sentinel_mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&path)?
+            .set_times(fs::FileTimes::new().set_modified(sentinel_mtime))?;
+        let original_mtime = fs::metadata(&path)?.modified()?;
+
+        insert_module_line(
+            path.to_str().unwrap_or_default(),
+            ACCOUNT_LINE,
+            None,
+            None,
+            true,
+            false,
+        )?;
+
+        assert_eq!(read_to_string(&path)?, existing);
+        assert_eq!(fs::metadata(&path)?.modified()?, original_mtime);
+        remove_temp_file(&path)
+    }
+
+    #[test]
+    fn adds_terminal_denial_to_legacy_pam_auth_update_jump() {
+        assert_eq!(
+            preserve_numeric_account_success(
+                "account [success=2 default=ignore] pam_himmelblau.so"
+            )
+            .as_deref(),
+            Some("account [success=2 auth_err=die default=ignore] pam_himmelblau.so")
+        );
+    }
+
+    #[test]
+    fn preserves_numeric_account_jump_during_update() -> anyhow::Result<()> {
+        let path = temp_pam_file(
+            "numeric-account-jump",
+            concat!(
+                "account [success=2 default=ignore] ",
+                "pam_himmelblau.so ignore_unknown_user\n",
+                "account required pam_unix.so\n"
+            ),
+        )?;
+
+        insert_module_line(
+            path.to_str().unwrap_or_default(),
+            ACCOUNT_LINE,
+            None,
+            None,
+            true,
+            false,
+        )?;
+
+        let content = read_to_string(&path)?;
+        assert_eq!(
+            content,
+            concat!(
+                "account [success=2 auth_err=die default=ignore] ",
+                "pam_himmelblau.so ignore_unknown_user\n",
+                "account required pam_unix.so\n"
+            )
+        );
+        remove_temp_file(&path)
+    }
+
+    #[test]
+    fn replaces_success_end_account_line() -> anyhow::Result<()> {
+        let path = temp_pam_file(
+            "success-end",
+            concat!(
+                "account [success=end auth_err=die default=ignore] ",
+                "pam_himmelblau.so ignore_unknown_user\n",
+                "account required pam_unix.so\n"
+            ),
+        )?;
+
+        insert_module_line(
+            path.to_str().unwrap_or_default(),
+            ACCOUNT_LINE,
+            None,
+            None,
+            true,
+            false,
+        )?;
+
+        let content = read_to_string(&path)?;
+        assert_eq!(
+            content,
+            format!("{}\naccount required pam_unix.so\n", ACCOUNT_LINE)
+        );
+        remove_temp_file(&path)
+    }
+
+    #[test]
+    fn non_replacement_mode_keeps_legacy_line() -> anyhow::Result<()> {
+        let path = temp_pam_file(
+            "legacy-auth",
+            "auth required pam_himmelblau.so ignore_unknown_user set_authtok\nauth required pam_unix.so\n",
+        )?;
+
+        insert_module_line(
+            path.to_str().unwrap_or_default(),
+            "auth\tsufficient\tpam_himmelblau.so ignore_unknown_user set_authtok",
+            None,
+            None,
+            false,
+            false,
+        )?;
+
+        let content = read_to_string(&path)?;
+        assert_eq!(
+            content,
+            "auth required pam_himmelblau.so ignore_unknown_user set_authtok\nauth required pam_unix.so\n"
+        );
+        remove_temp_file(&path)
+    }
+
+    const DONATIONS_URL: &str = "https://himmelblau-idm.org/donations/";
+
+    #[test]
+    fn donation_message_matches_feature_setting() {
+        let help = HimmelblauUnixParser::command()
+            .render_long_help()
+            .to_string();
+
+        #[cfg(feature = "donation-messages")]
+        assert_eq!(help.matches(DONATIONS_URL).count(), 1);
+
+        #[cfg(not(feature = "donation-messages"))]
+        assert!(!help.contains(DONATIONS_URL));
+    }
+
+    #[test]
+    fn donation_message_is_not_in_subcommand_help() {
+        let command = HimmelblauUnixParser::command();
+        let mut status = command
+            .find_subcommand("status")
+            .expect("status subcommand must exist")
+            .clone();
+
+        assert!(!status
+            .render_long_help()
+            .to_string()
+            .contains(DONATIONS_URL));
     }
 }
