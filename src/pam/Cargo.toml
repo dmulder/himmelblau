@@ -8,7 +8,6 @@ authors.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
-homepage.workspace = true
 repository.workspace = true
 
 [lib]
@@ -33,6 +32,7 @@ assets = [
   ["target/release/libpam_himmelblau.so", "usr/lib/security/pam_himmelblau.so", "755"],
   ["../../platform/debian/pam-config", "usr/share/pam-configs/himmelblau", "644"],
   ["../../platform/debian/pam-config-unseal", "usr/share/pam-configs/himmelblau-unseal", "644"],
+  ["../../man/man8/pam_himmelblau.8", "usr/share/man/man8/", "644"],
 ]
 recommends = ["patch"]
 maintainer-scripts = "scripts"
@@ -45,6 +45,7 @@ assets = [
   { source = "platform/el/authselect/*", dest = "/usr/share/authselect/vendor/himmelblau/", mode = "755" },
   { source = "platform/opensuse/pam-config", dest = "/usr/lib/pam-config.d/himmelblau.conf", mode = "644" },
   { source = "platform/opensuse/pam-config-unseal", dest = "/usr/lib/pam-config.d/himmelblau-unseal.conf", mode = "644" },
+  { source = "../../man/man8/pam_himmelblau.8", dest = "/usr/share/man/man8/", mode = "644", doc = true },
 ]
 post_install_script = '''
 # Only create a symlink if it doesn't already exist
@@ -76,9 +77,9 @@ fix_pam_config_account_line() {
 
     [ -f "$pc" ] || return 1
 
-    # Detect the known-bad pam-config output:
-    #   account required pam_himmelblau.so ignore_unknown_user
-    if ! grep -Eq '^[[:space:]]*account[[:space:]]+required[[:space:]]+pam_himmelblau\.so([[:space:]]+|$).*ignore_unknown_user' "$pc"; then
+    # Detect legacy/simple pam-config output:
+    #   account required|sufficient pam_himmelblau.so ignore_unknown_user
+    if ! grep -Eq '^[[:space:]]*account[[:space:]]+(required|sufficient)[[:space:]]+pam_himmelblau\.so([[:space:]]+|$).*ignore_unknown_user' "$pc"; then
         return 0
     fi
 
@@ -88,9 +89,10 @@ fix_pam_config_account_line() {
         chmod --reference="$pc" "$plain" || :
     fi
 
-    # Fix required -> sufficient in the self-managed file
+    # Make explicit himmelblau account denials terminal while preserving
+    # PAM_IGNORE fall-through for local users.
     sed -i -E \
-        's/^([[:space:]]*account[[:space:]]+)required([[:space:]]+pam_himmelblau\.so([[:space:]]+|$).*ignore_unknown_user)/\1sufficient\2/' \
+        's#^([[:space:]]*account[[:space:]]+)(required|sufficient)([[:space:]]+pam_himmelblau\.so([[:space:]]+|$).*ignore_unknown_user)#\1[success=ok auth_err=die default=ignore]\3#' \
         "$plain" || return 1
 
     return 0
