@@ -31,7 +31,7 @@ webpki-roots-0-26-11 = { package = "webpki-roots", path = "src/overrides/webpki-
 rsa-0-9-999 = { package = "rsa", path = "src/overrides/rsa/0.9.999" }
 
 [workspace.package]
-version = "3.1.15"
+version = "3.1.16"
 authors = [
     "David Mulder <dmulder@suse.com>"
 ]

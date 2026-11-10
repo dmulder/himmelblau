@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "aad-tool"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "anyhow",
  "broker-client",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "broker"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "dbus",
  "himmelblau_unix_common",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "broker-client"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "serde_json",
  "zbus",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "himmelblau-fuzz"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "arbitrary",
  "himmelblau_unix_common",
@@ -2086,7 +2086,7 @@ dependencies = [
 
 [[package]]
 name = "himmelblau_policies"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "himmelblau_unix_common"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2159,7 +2159,7 @@ dependencies = [
 
 [[package]]
 name = "himmelblaud"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2549,7 +2549,7 @@ dependencies = [
 
 [[package]]
 name = "idmap"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "bindgen",
  "cc",
@@ -3332,7 +3332,7 @@ checksum = "5e0826a989adedc2a244799e823aece04662b66609d96af8dff7ac6df9a8925d"
 
 [[package]]
 name = "nss_himmelblau"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "himmelblau_unix_common",
  "lazy_static",
@@ -3421,7 +3421,7 @@ dependencies = [
 
 [[package]]
 name = "o365"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -3723,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "pam_himmelblau"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "himmelblau_unix_common",
  "libc",
@@ -4161,7 +4161,7 @@ dependencies = [
 
 [[package]]
 name = "qr-greeter"
-version = "3.1.15"
+version = "3.1.16"
 
 [[package]]
 name = "qrcodegen"
@@ -4870,7 +4870,7 @@ dependencies = [
 
 [[package]]
 name = "selinux"
-version = "3.1.15"
+version = "3.1.16"
 
 [[package]]
 name = "semver"
@@ -5230,11 +5230,11 @@ dependencies = [
 
 [[package]]
 name = "sshd-config"
-version = "3.1.15"
+version = "3.1.16"
 
 [[package]]
 name = "sso"
-version = "3.1.15"
+version = "3.1.16"
 dependencies = [
  "broker-client",
  "clap",
@@ -5246,7 +5246,7 @@ dependencies = [
 
 [[package]]
 name = "sso-policies"
-version = "3.1.15"
+version = "3.1.16"
 
 [[package]]
 name = "stable_deref_trait"
