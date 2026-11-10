@@ -25,9 +25,18 @@ use std::error::Error;
 use std::io::{self, Read, Write};
 use uuid::Uuid;
 
-const SSO_URL_DEFAULT: &str = "https://login.microsoftonline.com/";
 const EDGE_BROWSER_CLIENT_ID: &str = "d7b530a4-7680-4c23-a8bf-c52c121d2e87";
 const GRAPH_SCOPES: [&str; 1] = ["https://graph.microsoft.com/.default"];
+
+/// Write a diagnostic line to stderr, ignoring write errors.
+///
+/// The browser decides where stderr goes, so diagnostics are best-effort: a
+/// failed write must not stop the native messaging host.
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        let _ = writeln!(io::stderr(), $($arg)*);
+    }};
+}
 
 struct NativeMessaging;
 
@@ -64,6 +73,25 @@ struct SsoMib {
     session_id: String,
 }
 
+fn account_environment(accounts: &Value, account: &Value) -> Result<String, &'static str> {
+    let username = account
+        .get("username")
+        .and_then(Value::as_str)
+        .ok_or("Account has no username")?;
+    accounts["accounts"]
+        .as_array()
+        .and_then(|accounts| {
+            accounts.iter().find(|candidate| {
+                candidate["username"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(username))
+            })
+        })
+        .and_then(|account| account["environment"].as_str())
+        .map(str::to_string)
+        .ok_or("Account has no configured authority environment")
+}
+
 impl SsoMib {
     async fn new() -> Result<Self, Box<dyn Error>> {
         let broker = BrokerClient::new().await?;
@@ -73,16 +101,21 @@ impl SsoMib {
         })
     }
 
-    fn _get_auth_parameters(&self, account: &Value, scopes: Vec<&str>) -> Value {
+    async fn configured_environment(&self, account: &Value) -> Result<String, Box<dyn Error>> {
+        let accounts = self.get_accounts().await?;
+        Ok(account_environment(&accounts, account)?)
+    }
+
+    fn _get_auth_parameters(&self, account: &Value, scopes: Vec<&str>, environment: &str) -> Value {
         json!({
             "account": account.clone(),
             "additionalQueryParametersForAuthorization": {},
-            "authority": "https://login.microsoftonline.com/common",
+            "authority": format!("https://{environment}/common"),
             "authorizationType": 8,
             "clientId": EDGE_BROWSER_CLIENT_ID,
             "redirectUri": "https://login.microsoftonline.com/common/oauth2/nativeclient",
             "requestedScopes": scopes,
-            "ssoUrl": SSO_URL_DEFAULT,
+            "ssoUrl": format!("https://{environment}/"),
         })
     }
 
@@ -103,18 +136,20 @@ impl SsoMib {
     async fn acquire_prt_sso_cookie(
         &self,
         account: &Value,
-        sso_url: &str,
+        sso_url: Option<&str>,
         scopes: Option<Vec<&str>>,
     ) -> Result<Value, Box<dyn Error>> {
         let scopes = scopes.unwrap_or(GRAPH_SCOPES.to_vec());
+        let environment = self.configured_environment(account).await?;
+        let default_sso_url = format!("https://{environment}/");
         self.broker
             .acquire_prt_sso_cookie(
                 "0.0",
                 &self.session_id,
                 &json!({
                     "account": account,
-                    "authParameters": self._get_auth_parameters(account, scopes),
-                    "ssoUrl": sso_url,
+                    "authParameters": self._get_auth_parameters(account, scopes, &environment),
+                    "ssoUrl": sso_url.unwrap_or(&default_sso_url),
                 }),
             )
             .await
@@ -127,13 +162,14 @@ impl SsoMib {
         scopes: Option<Vec<&str>>,
     ) -> Result<Value, Box<dyn Error>> {
         let scopes = scopes.unwrap_or(GRAPH_SCOPES.to_vec());
+        let environment = self.configured_environment(account).await?;
         self.broker
             .acquire_token_silently(
                 "0.0",
                 &self.session_id,
                 &json!({
                     "account": account,
-                    "authParameters": self._get_auth_parameters(account, scopes),
+                    "authParameters": self._get_auth_parameters(account, scopes, &environment),
                 }),
             )
             .await
@@ -166,8 +202,8 @@ struct Args {
     account: usize,
 
     /// ssoUrl part of SSO PRT cookie request
-    #[arg(name = "ssoUrl", short, long, default_value_t = SSO_URL_DEFAULT.to_string())]
-    sso_url: String,
+    #[arg(name = "ssoUrl", short, long)]
+    sso_url: Option<String>,
 
     #[command(subcommand)]
     command: Option<SubCommands>,
@@ -203,7 +239,7 @@ async fn run_interactive() -> Result<(), Box<dyn Error>> {
         Some(SubCommands::AcquirePrtSsoCookie) => {
             let account = &accounts["accounts"][args.account];
             let cookie = ssomib
-                .acquire_prt_sso_cookie(account, &args.sso_url, None)
+                .acquire_prt_sso_cookie(account, args.sso_url.as_deref(), None)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&cookie)?);
         }
@@ -218,8 +254,8 @@ async fn run_interactive() -> Result<(), Box<dyn Error>> {
 }
 
 async fn run_as_native_messaging() -> Result<(), Box<dyn Error>> {
-    eprintln!("Running as native messaging instance.");
-    eprintln!("For interactive mode, start with --interactive");
+    log!("Running as native messaging instance.");
+    log!("For interactive mode, start with --interactive");
 
     let ssomib = SsoMib::new().await?;
     NativeMessaging::send_message(&NativeMessaging::encode_message(&json!({
@@ -229,53 +265,47 @@ async fn run_as_native_messaging() -> Result<(), Box<dyn Error>> {
 
     loop {
         let received_message = NativeMessaging::get_message()?;
-        match received_message["command"].as_str() {
-            Some("acquirePrtSsoCookie") => {
-                let account = &received_message["account"];
-                let sso_url = received_message
-                    .get("ssoUrl")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(SSO_URL_DEFAULT);
-                let cookie = ssomib
-                    .acquire_prt_sso_cookie(account, sso_url, None)
-                    .await?;
-                NativeMessaging::send_message(&NativeMessaging::encode_message(&json!({
-                    "command": received_message["command"],
-                    "message": cookie,
-                }))?)?;
+        // A failed request is answered with an error message, like the
+        // upstream host does, so the extension keeps its connection and can
+        // retry. Exiting here would only surface as a lost connection.
+        let message = match handle_command(&ssomib, &received_message).await {
+            Ok(message) => message,
+            Err(e) => {
+                log!("{:?} failed: {}", received_message["command"], e);
+                json!({ "error": format!("Failure during request processing: {}", e) })
             }
-            Some("acquireTokenSilently") => {
-                let account = &received_message["account"];
-                let scopes = received_message
-                    .get("scopes")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-                    .unwrap_or(GRAPH_SCOPES.to_vec());
-                let token = ssomib.acquire_token_silently(account, Some(scopes)).await?;
-                NativeMessaging::send_message(&NativeMessaging::encode_message(&json!({
-                    "command": received_message["command"],
-                    "message": token,
-                }))?)?;
-            }
-            Some("getAccounts") => {
-                NativeMessaging::send_message(&NativeMessaging::encode_message(&json!({
-                    "command": received_message["command"],
-                    "message": ssomib.get_accounts().await?,
-                }))?)?;
-            }
-            Some("getVersion") => {
-                NativeMessaging::send_message(&NativeMessaging::encode_message(&json!({
-                    "command": received_message["command"],
-                    "message": ssomib.get_broker_version().await?,
-                }))?)?;
-            }
-            _ => {
-                eprintln!("Invalid request '{:?}'", received_message["command"]);
-                NativeMessaging::send_message(&NativeMessaging::encode_message(&json!({
-                    "command": received_message["command"],
-                    "message": { "error": "Invalid request" },
-                }))?)?;
-            }
+        };
+        NativeMessaging::send_message(&NativeMessaging::encode_message(&json!({
+            "command": received_message["command"],
+            "message": message,
+        }))?)?;
+    }
+}
+
+async fn handle_command(
+    ssomib: &SsoMib,
+    received_message: &Value,
+) -> Result<Value, Box<dyn Error>> {
+    match received_message["command"].as_str() {
+        Some("acquirePrtSsoCookie") => {
+            let account = &received_message["account"];
+            let sso_url = received_message.get("ssoUrl").and_then(|v| v.as_str());
+            ssomib.acquire_prt_sso_cookie(account, sso_url, None).await
+        }
+        Some("acquireTokenSilently") => {
+            let account = &received_message["account"];
+            let scopes = received_message
+                .get("scopes")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                .unwrap_or(GRAPH_SCOPES.to_vec());
+            ssomib.acquire_token_silently(account, Some(scopes)).await
+        }
+        Some("getAccounts") => ssomib.get_accounts().await,
+        Some("getVersion") => ssomib.get_broker_version().await,
+        _ => {
+            log!("Invalid request '{:?}'", received_message["command"]);
+            Ok(json!({ "error": "Invalid request" }))
         }
     }
 }
@@ -291,9 +321,27 @@ async fn main() {
 
     if interactive {
         if let Err(e) = run_interactive().await {
-            eprintln!("run_interactive failed: {:?}", e);
+            log!("run_interactive failed: {:?}", e);
         }
     } else if let Err(e) = run_as_native_messaging().await {
-        eprintln!("run_as_native_messaging failed: {:?}", e);
+        log!("run_as_native_messaging failed: {:?}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_the_matching_accounts_configured_environment() {
+        let accounts = json!({"accounts": [
+            {"username": "alice@example.com", "environment": "login.microsoftonline.com"},
+            {"username": "bob@agency.gov", "environment": "login.microsoftonline.us"},
+        ]});
+        assert_eq!(
+            account_environment(&accounts, &json!({"username": "BOB@AGENCY.GOV"})),
+            Ok("login.microsoftonline.us".to_string())
+        );
+        assert!(account_environment(&accounts, &json!({"username": "other@agency.gov"})).is_err());
     }
 }
